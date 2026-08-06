@@ -93,7 +93,8 @@ extensions don't always produce one. Belt and braces.
 ### 3. FileSystemWatcher **and** a polling sweep
 
 `FileSystemWatcher` is famously lossy: it silently drops events under buffer pressure, and misses
-everything that happens while the process is down. The polling sweep (`PollSeconds`, default 5 s)
+everything that happens while the process is down. The polling sweep (`PollSeconds`, default 300 s
+since v1.1.0 -- see decision 11)
 makes the system **self-healing** — restart the machine mid-download and the sweep picks the
 archive up on next start. The watcher provides latency; the sweep provides correctness.
 
@@ -126,8 +127,8 @@ This matters more than usual here: the tool auto-runs on files arriving from a b
 ### 7. Single-instance mutex
 
 Both an AtLogon and an AtStartup trigger can fire; a user can also run the script by hand. Two
-copies racing on the same archive would double-rename or half-extract. A named global mutex means
-the second copy logs and exits.
+copies racing on the same archive would double-rename or half-extract. A named mutex means the
+second copy logs and exits. (Scoped per watch folder since v1.1.0 — see decision 12.)
 
 `MultipleInstances = IgnoreNew` on the task is the same guarantee at the scheduler level.
 
