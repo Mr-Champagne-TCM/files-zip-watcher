@@ -1,0 +1,25 @@
+{
+  "_comment": "Edit and restart the task (Restart-Service equivalent: .\\install.ps1 -Restart). Paths accept %ENVVAR%.",
+
+  "WatchFolder": "%USERPROFILE%\\Downloads",
+  "ExtractTo": "%USERPROFILE%\\Downloads",
+
+  "_MatchPattern": "Regex against the FILE NAME only. Default matches files.zip plus Chrome's dedupe variants files (1).zip, files (2).zip ...",
+  "MatchPattern": "^files(?: \\(\\d+\\))?\\.zip$",
+
+  "_TimestampFormat": ".NET format string. Default yyyy-MM-dd-HH-mm -> files-2026-08-05-18-42.zip. See README 'Timestamp format' before changing.",
+  "TimestampFormat": "yyyy-MM-dd-HH-mm",
+  "RenamePrefix": "files-",
+
+  "KeepZipAfterExtract": true,
+  "Overwrite": true,
+
+  "_tuning": "Completion detection. StableSeconds x StableChecks = minimum quiet period before a download is considered done.",
+  "StableSeconds": 2,
+  "StableChecks": 3,
+  "PollSeconds": 5,
+  "SettleTimeoutSeconds": 900,
+
+  "LogDir": "%LOCALAPPDATA%\\FilesZipWatcher\\logs",
+  "LogRetentionDays": 30
+}

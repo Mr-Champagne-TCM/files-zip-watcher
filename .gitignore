@@ -1,0 +1,17 @@
+# Local overrides — copy config.json, don't commit machine-specific paths
+config.local.json
+
+# Logs (they live in %LOCALAPPDATA%, but just in case someone redirects them here)
+logs/
+*.log
+
+# Test leftovers
+fzw-test-*/
+
+# Windows / editor noise
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.swp
+*~
