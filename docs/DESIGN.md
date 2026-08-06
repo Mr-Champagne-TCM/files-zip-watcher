@@ -212,3 +212,44 @@ that also blocks your own tests is a bug, not a safety feature.**
 - Per-session subfolder mode as an option (`ExtractMode: flat | perArchive`).
 - Content hash of the archive in the log line, for tracing which payload produced which files.
 - Optional quarantine: extract to a temp dir, scan, then move into place.
+
+### 13. Provenance sidecar + post-extract verification (v1.2.0)
+
+Two failures on 2026-08-05 drove this, both about *not knowing what the tool had done*:
+
+1. Two `files.zip` payloads landed hours apart. Asked whether their contents differed, the answer
+   was **unknowable** — the earlier archive had been deleted and its files overwritten in place.
+   The investigation had to reason it out indirectly and got it wrong the first time.
+2. An unattended run replaced 8 files in Downloads. The only trace was the number `8`.
+
+**Sidecar.** Each extraction writes `<archive-basename>.sha256` — one line per extracted file plus
+a line for the archive itself. Format is plain `sha256sum`, chosen so that:
+- `sha256sum -c <file>` verifies the payload with no tool of ours involved, and
+- `diff` of two sidecars answers "did these payloads differ" instantly.
+
+Including the archive's own hash in its own manifest is what ties an extracted file set back to the
+exact bytes that produced it.
+
+**Post-extract verification — what it does and does not cover.** The entry's decompressed bytes are
+hashed while streaming to disk, then the file is read back and hashed. Deliberately **not** a
+re-check of archive integrity: `ZipArchive` validates each entry's CRC-32 during inflation and
+throws, so archive corruption is already caught and adding SHA-256 there would be redundant. The
+uncovered gap was the *write* — truncation, disk-full, kill mid-write, or post-write mutation by AV
+/ sync clients / a second writer. That is now closed.
+
+Both features are the **same computation**, which is why they shipped together: hash once on the
+way in, compare against disk, record both.
+
+**Failure policy:** verification failure logs ERROR, increments `verify-failed`, and **forces the
+archive to be retained** even under `KeepZipAfterExtract: false` — a bad extraction must never be
+the only surviving copy. Rollback is not attempted; that would need a staging directory
+(see *Possible next steps* — quarantine).
+
+**The CRLF bug is the lesson here.** The first implementation used `[IO.File]::WriteAllLines`,
+which emits `Environment.NewLine` — CRLF on Windows. GNU `sha256sum -c` then reads each filename as
+`name\r` and fails **every single line** with "No such file or directory". The manifest looked
+perfect in the log, in `Get-Content`, and in the unit test; it was worthless to the one tool it
+existed to serve. Caught only by running the real payload and actually invoking `sha256sum -c`.
+Regression test now asserts zero CR bytes.
+
+> Emitting a standard format is worth nothing until you have run the standard tool against it.

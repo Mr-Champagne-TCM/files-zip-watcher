@@ -11,6 +11,9 @@ When one lands, it:
 4. **Overwrites** any colliding files.
 5. **Keeps** the renamed archive (configurable).
 
+6. **Verifies** every extracted file against its own decompressed hash, and writes a
+   `files-<timestamp>.sha256` manifest recording the archive and everything that came out of it.
+
 Everything else in the folder is ignored.
 
 ```
@@ -132,6 +135,49 @@ was stopped, so a reboot mid-download still gets handled.
 
 ---
 
+## Provenance and integrity
+
+Every extraction leaves a receipt. Next to `files-2026-08-05-21-28.zip` you get
+`files-2026-08-05-21-28.sha256`:
+
+```
+710e3e07…  *files-2026-08-05-21-28.zip     <- the archive itself
+e6704117…  *mockup_gen.py
+460cee36…  *MU16_frame_param.svg
+0ddd58e3…  *MU13_front_param.svg
+…
+```
+
+Plain `sha256sum` format on purpose — no bespoke tooling required:
+
+```bash
+sha256sum -c files-2026-08-05-21-28.sha256      # verify the whole payload
+diff <(tail -n +2 A.sha256|sort) <(tail -n +2 B.sha256|sort)   # did two payloads differ?
+```
+
+That second command is why this exists. On 2026-08-05 two `files.zip` payloads landed hours apart
+and there was **no way to answer whether their contents differed** — the earlier archive was gone
+and its files had been overwritten in place. It cost hours. Now it costs one `diff`.
+
+**Post-extract verification.** Each entry's decompressed bytes are hashed as they stream to disk,
+then the file is read back off disk and hashed again. Mismatch → logged as ERROR, counted as
+`verify-failed`, and the archive is retained even if `KeepZipAfterExtract` is `false`.
+
+This is **not** a re-check of the archive — .NET validates each entry's CRC-32 while inflating, so
+a corrupt archive already throws. What is verified here is **the write**: truncation, a full disk,
+a process kill mid-write, or something touching the file right after we close it (AV quarantine, a
+sync client, a second writer).
+
+**Overwrites are named, not counted.** A bare `overwritten 8` tells you nothing at 3 a.m.:
+
+```
+[WARN ] OVERWROTE 15 existing file(s):
+[WARN ]     ~ mockup_gen.py
+[WARN ]     ~ MU16_frame_param.svg
+[OK   ] Integrity: all 15 extracted file(s) verified against their decompressed hash
+[OK   ] Manifest -> files-2026-08-05-21-28.sha256  (15 files + archive)
+```
+
 ## Running light
 
 Design goal: **zero perceptible battery drain**. Three things get it there.
@@ -217,6 +263,8 @@ After editing, apply with `.\install.ps1 -Restart`.
 | `RenamePrefix` | `files-` | Prefix for the renamed archive |
 | `KeepZipAfterExtract` | `true` | `false` deletes the archive after a successful extract |
 | `Overwrite` | `true` | `false` skips colliding files instead |
+| `WriteManifest` | `true` | Write the `.sha256` sidecar per extraction |
+| `ManifestExtension` | `.sha256` | Sidecar extension |
 | `StableSeconds` / `StableChecks` | `2` / `3` | Quiet period before "complete" |
 | `PollSeconds` | `300` | Safety-net interval. Detection is event-driven, so long is fine |
 | `SettleTimeoutSeconds` | `900` | Give up on a stalled download |
@@ -263,7 +311,7 @@ A processed archive looks like:
 
 Runs entirely in a temp sandbox — **it never touches your real Downloads folder**. It builds a
 synthetic `files.zip` (plain file, nested folder, a deliberate collision, and a zip-slip attack
-entry) and asserts **13** behaviours including flat extraction, overwrite, no wrapper folder,
+entry) and asserts **22** behaviours including flat extraction, overwrite, no wrapper folder,
 traversal refusal, non-matching zips ignored, and that a `files (1).zip` variant is refused *and*
 raises the orphan warning.
 

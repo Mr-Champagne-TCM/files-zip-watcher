@@ -3,6 +3,45 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] — 2026-08-05
+
+Provenance and integrity. Driven by a real incident the same day: two `files.zip` payloads landed
+hours apart, and there was **no way to tell whether their contents differed** — the earlier archive
+had been deleted and its files overwritten in place. Separately, an unattended run replaced 8 files
+with nothing in the log but the number `8`.
+
+### Added
+- **Manifest sidecar per extraction.** Alongside `files-<stamp>.zip`, writes
+  `files-<stamp>.sha256`: one line per extracted file **plus a line for the archive itself**.
+  Deliberately plain `sha256sum` format, so `sha256sum -c files-<stamp>.sha256` verifies the whole
+  payload with no bespoke tooling — and two extractions can be compared with `diff`.
+- **Post-extract verification.** Each entry's decompressed bytes are SHA-256'd as they stream to
+  disk; the file is then **read back off disk and hashed again**. A mismatch is logged as an ERROR
+  and counted (`verify-failed N`).
+  *This is not a re-check of the archive* — .NET validates each entry's CRC-32 during inflation, so
+  a corrupt archive already throws. What this verifies is **the write**: truncation, a full disk, a
+  kill mid-write, or something modifying the file immediately after us (AV quarantine, sync client,
+  a second writer).
+- **Overwrites logged by name**, not just counted — `~ mockup_gen.py` per replaced file.
+- Archive is **retained even when `KeepZipAfterExtract: false`** if any file failed verification —
+  it is then the only trustworthy copy.
+- Config: `WriteManifest` (default `true`), `ManifestExtension` (default `.sha256`).
+- Self-test grown 13 → 22 assertions covering the manifest, its format, hash-vs-disk agreement,
+  by-name overwrite logging, and LF termination.
+
+### Fixed
+- **Sidecar was written CRLF, which broke `sha256sum -c` entirely** — GNU coreutils treats the
+  trailing `\r` as part of the filename and reports *"No such file or directory"* for every line,
+  defeating the whole reason for using a standard format. Now LF-terminated, with a regression test
+  asserting zero CR bytes. Found on the first real-payload run, not by the unit test (PowerShell's
+  `Get-Content` strips CRLF, hiding it).
+
+### Verified on real data
+Re-ran the actual 15-file 05F payload through it: `verify-failed 0`, all 15 hashes cross-check
+against the project's own source manifest (`mockup_gen.py e6704117…`, `MU16 460cee36…`,
+`MU13 0ddd58e3…`), `sha256sum -c` reports OK for every line, and diffing two separate extractions
+of the same archive shows them byte-identical.
+
 ## [1.1.0] — 2026-08-05
 
 Power/footprint pass and exact-name policy, per feedback after the v1.0.0 live install.

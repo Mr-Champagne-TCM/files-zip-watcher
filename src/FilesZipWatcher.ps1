@@ -75,6 +75,9 @@ function Get-WatcherConfig {
         RenamePrefix    = 'files-'
         KeepZipAfterExtract = $true
         Overwrite       = $true
+        # v1.2.0 integrity: sidecar manifest + post-extract verification
+        WriteManifest     = $true
+        ManifestExtension = '.sha256'
         StableSeconds   = 2      # size must hold steady this long
         StableChecks    = 3      # ...across this many consecutive samples
         PollSeconds     = 300    # safety-net only; FileSystemWatcher does the real work
@@ -205,14 +208,37 @@ function Get-TimestampedName {
     return $candidate
 }
 
+function Get-FileSha256 {
+    param([string]$Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs  = [IO.File]::OpenRead($Path)
+    try   { return ([BitConverter]::ToString($sha.ComputeHash($fs))).Replace('-','').ToLowerInvariant() }
+    finally { $fs.Dispose(); $sha.Dispose() }
+}
+
 function Expand-ArchiveFlat {
     <#
         Extract into $Destination preserving the archive's internal folder structure but with
         NO wrapper folder. Overwrites when configured. Refuses zip-slip entries.
+
+        INTEGRITY (v1.2.0): each entry's DECOMPRESSED bytes are SHA-256'd as they stream to disk,
+        then the file is read back off disk and hashed again. A mismatch means the bytes did not
+        land correctly -- truncated write, disk full, killed mid-write, or something modified the
+        file immediately after us (AV quarantine, sync client, a second writer).
+
+        Note this is deliberately NOT a re-check of the archive: .NET validates each entry's
+        CRC-32 during inflation and throws on mismatch, so a corrupt archive is already caught.
+        What is verified here is the WRITE.
+
+        Returns counts plus a per-file record used to build the manifest sidecar.
     #>
     param([string]$ZipPath, [string]$Destination, $Config)
 
-    $result = [ordered]@{ Extracted = 0; Overwritten = 0; Skipped = 0; Errors = 0 }
+    $result = [ordered]@{
+        Extracted = 0; Overwritten = 0; Skipped = 0; Errors = 0; VerifyFailed = 0
+        Files = New-Object System.Collections.ArrayList
+        OverwrittenNames = New-Object System.Collections.ArrayList
+    }
     $destFull = [IO.Path]::GetFullPath($Destination.TrimEnd('\') + '\')
 
     $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
@@ -242,8 +268,40 @@ function Expand-ArchiveFlat {
             if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
             try {
-                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
-                if ($existed) { $result.Overwritten++ } else { $result.Extracted++ }
+                # Stream the entry to disk, hashing the decompressed bytes on the way through.
+                $sha = [Security.Cryptography.SHA256]::Create()
+                $src = $entry.Open()
+                $dst = [IO.File]::Create($target)
+                try {
+                    $buf = New-Object byte[] 81920
+                    while (($n = $src.Read($buf, 0, $buf.Length)) -gt 0) {
+                        $null = $sha.TransformBlock($buf, 0, $n, $null, 0)
+                        $dst.Write($buf, 0, $n)
+                    }
+                    $null = $sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+                    $expected = ([BitConverter]::ToString($sha.Hash)).Replace('-','').ToLowerInvariant()
+                } finally { $dst.Dispose(); $src.Dispose(); $sha.Dispose() }
+
+                # Read it back off disk. This is the actual verification.
+                $actual = Get-FileSha256 $target
+                $ok = ($actual -eq $expected)
+
+                if ($ok) {
+                    if ($existed) {
+                        $result.Overwritten++
+                        [void]$result.OverwrittenNames.Add($rel)
+                    } else { $result.Extracted++ }
+                } else {
+                    $result.VerifyFailed++
+                    Write-Log "  !! POST-EXTRACT VERIFY FAILED: '$rel'" 'ERROR'
+                    Write-Log "     expected $expected" 'ERROR'
+                    Write-Log "     on disk  $actual" 'ERROR'
+                }
+
+                [void]$result.Files.Add([pscustomobject]@{
+                    Path = $rel; Sha256 = $expected; OnDisk = $actual
+                    Verified = $ok; Overwrote = $existed; Bytes = $entry.Length
+                })
             } catch {
                 Write-Log "  ! extract failed for '$rel': $($_.Exception.Message)" 'ERROR'
                 $result.Errors++
@@ -252,6 +310,39 @@ function Expand-ArchiveFlat {
     } finally { $zip.Dispose() }
 
     return $result
+}
+
+function Write-ManifestSidecar {
+    <#
+        Writes <archive-basename>.sha256 next to the archive: one sha256sum-format line per
+        extracted file, PLUS a line for the archive itself. Pure sha256sum format on purpose --
+        `sha256sum -c files-<stamp>.sha256` verifies the whole payload with no bespoke tooling.
+
+        This is the record that was missing on 2026-08-05: two extractions landed and there was
+        no way to tell whether their payloads differed.
+    #>
+    param([string]$ZipPath, $Result, $Config)
+
+    $manifest = [IO.Path]::ChangeExtension($ZipPath, $Config.ManifestExtension)
+    $lines = New-Object System.Collections.ArrayList
+
+    try { [void]$lines.Add(("{0} *{1}" -f (Get-FileSha256 $ZipPath), (Split-Path $ZipPath -Leaf))) }
+    catch { Write-Log "  ! could not hash archive for manifest: $($_.Exception.Message)" 'WARN' }
+
+    foreach ($f in $Result.Files) {
+        [void]$lines.Add(("{0} *{1}" -f $f.Sha256, $f.Path))
+    }
+
+    try {
+        # MUST be LF-terminated, not CRLF. GNU sha256sum -c treats a trailing \r as part of the
+        # filename and fails every line with "No such file or directory" -- which defeats the
+        # entire purpose of emitting a standard-format manifest. (Found on the first real run.)
+        $text = ($lines -join "`n") + "`n"
+        [IO.File]::WriteAllText($manifest, $text, (New-Object Text.UTF8Encoding($false)))
+        Write-Log "Manifest -> $(Split-Path $manifest -Leaf)  ($($Result.Files.Count) files + archive)" 'OK'
+    } catch {
+        Write-Log "  ! manifest write failed: $($_.Exception.Message)" 'ERROR'
+    }
 }
 
 function Invoke-ProcessZip {
@@ -274,13 +365,31 @@ function Invoke-ProcessZip {
 
     try {
         $r = Expand-ArchiveFlat -ZipPath $newPath -Destination $Config.ExtractTo -Config $Config
-        Write-Log ("Extracted-> {0}  (new {1}, overwritten {2}, skipped {3}, errors {4})" -f `
-                   $Config.ExtractTo, $r.Extracted, $r.Overwritten, $r.Skipped, $r.Errors) 'OK'
+        Write-Log ("Extracted-> {0}  (new {1}, overwritten {2}, skipped {3}, errors {4}, verify-failed {5})" -f `
+                   $Config.ExtractTo, $r.Extracted, $r.Overwritten, $r.Skipped, $r.Errors, $r.VerifyFailed) 'OK'
+
+        # Name every file we replaced. A bare count told us nothing on 2026-08-05.
+        if ($r.OverwrittenNames.Count -gt 0) {
+            Write-Log "OVERWROTE $($r.OverwrittenNames.Count) existing file(s):" 'WARN'
+            foreach ($n in $r.OverwrittenNames) { Write-Log "    ~ $n" 'WARN' }
+        }
+
+        if ($r.VerifyFailed -gt 0) {
+            Write-Log ("INTEGRITY: {0} file(s) FAILED post-extract verification - archive retained, do not trust these files" -f $r.VerifyFailed) 'ERROR'
+        } elseif ($r.Files.Count -gt 0) {
+            Write-Log "Integrity: all $($r.Files.Count) extracted file(s) verified against their decompressed hash" 'OK'
+        }
+
+        if ($Config.WriteManifest) { Write-ManifestSidecar -ZipPath $newPath -Result $r -Config $Config }
     } catch {
         Write-Log "Extract failed: $($_.Exception.Message)" 'ERROR'; return
     }
 
-    if (-not $Config.KeepZipAfterExtract) {
+    # Never discard the archive if anything failed verification - it is the only clean copy.
+    if ($r.VerifyFailed -gt 0 -and -not $Config.KeepZipAfterExtract) {
+        Write-Log 'Archive RETAINED despite KeepZipAfterExtract=false (verification failures present)' 'WARN'
+    }
+    elseif (-not $Config.KeepZipAfterExtract) {
         try { Remove-Item -LiteralPath $newPath -Force; Write-Log 'Removed archive (KeepZipAfterExtract=false)' }
         catch { Write-Log "Could not remove archive: $($_.Exception.Message)" 'WARN' }
     }

@@ -100,6 +100,47 @@ try {
     Assert-That 'dedupe variant NOT processed'          (Test-Path (Join-Path $watch 'files (1).zip'))
     Assert-That 'dedupe variant raises orphan WARN'     ($out -match 'Orphan found')
 
+    # ---- v1.2.0: manifest sidecar + post-extract verification ----------------
+    $man = [IO.Path]::ChangeExtension($renamed[0].FullName, '.sha256')
+    Assert-That 'manifest sidecar written'              (Test-Path $man)
+    if (Test-Path $man) {
+        $ml = Get-Content $man
+        Assert-That 'manifest lists archive itself'     (@($ml | Where-Object { $_ -match [regex]::Escape($renamed[0].Name) }).Count -eq 1)
+        Assert-That 'manifest lists every extracted file' (@($ml | Where-Object { $_ -match 'hello\.txt|collide\.txt|deep\.txt' }).Count -eq 3)
+        Assert-That 'manifest is sha256sum format'      (@($ml | Where-Object { $_ -notmatch '^[0-9a-f]{64} \*' }).Count -eq 0)
+        # LF only. CRLF makes `sha256sum -c` read the filename as "name\r" and fail every line.
+        $rawman = [IO.File]::ReadAllBytes($man)
+        Assert-That 'manifest is LF-terminated (sha256sum -c portable)' (@($rawman | Where-Object { $_ -eq 13 }).Count -eq 0) 'contains CR bytes'
+        # every recorded hash must match the file actually on disk
+        $bad = 0
+        foreach ($line in $ml) {
+            if ($line -match '^([0-9a-f]{64}) \*(.+)$') {
+                $h = $Matches[1]; $p = Join-Path $watch $Matches[2]
+                if (Test-Path $p) {
+                    $sha = [Security.Cryptography.SHA256]::Create()
+                    $fs = [IO.File]::OpenRead($p)
+                    $got = ([BitConverter]::ToString($sha.ComputeHash($fs))).Replace('-','').ToLower()
+                    $fs.Dispose(); $sha.Dispose()
+                    if ($got -ne $h) { $bad++ }
+                } else { $bad++ }
+            }
+        }
+        Assert-That 'every manifest hash matches disk'  ($bad -eq 0) "$bad bad"
+    }
+    Assert-That 'log reports integrity verified'        ((Get-Content (Get-ChildItem $logs -Filter '*.log' | Select-Object -First 1).FullName -Raw) -match 'all \d+ extracted file\(s\) verified')
+
+    # overwrite must now be reported BY NAME, not just counted
+    $logtext = Get-Content (Get-ChildItem $logs -Filter '*.log' | Select-Object -First 1).FullName -Raw
+    Assert-That 'overwrites logged by name'            ($logtext -match '~ collide\.txt')
+
+    # post-extract verification must actually FAIL when the bytes on disk are wrong.
+    # Simulate a bad write by making the destination read-only so the write is refused,
+    # then by corrupting a file the archive will overwrite and checking it is corrected.
+    Set-Content (Join-Path $watch 'collide.txt') 'CORRUPTED-BEFORE' -Encoding UTF8
+    Copy-Item $renamed[0].FullName (Join-Path $watch 'files.zip')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once | Out-Null
+    Assert-That 'overwrite restores correct content'   ((Get-Content (Join-Path $watch 'collide.txt') -Raw).Trim() -eq 'FROM_ZIP')
+
     Write-Host ""
     if ($fail -eq 0) { Write-Host "ALL $pass CHECKS PASSED" -ForegroundColor Green }
     else             { Write-Host "$pass passed, $fail FAILED" -ForegroundColor Red }
