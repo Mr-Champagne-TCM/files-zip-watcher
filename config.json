@@ -1,23 +1,27 @@
 {
-  "_comment": "Edit and restart the task (Restart-Service equivalent: .\\install.ps1 -Restart). Paths accept %ENVVAR%.",
+  "_comment": "Edit, then apply with .\\install.ps1 -Restart. Paths accept %ENVVAR%.",
 
   "WatchFolder": "%USERPROFILE%\\Downloads",
   "ExtractTo": "%USERPROFILE%\\Downloads",
 
-  "_MatchPattern": "Regex against the FILE NAME only. Default matches files.zip plus Chrome's dedupe variants files (1).zip, files (2).zip ...",
-  "MatchPattern": "^files(?: \\(\\d+\\))?\\.zip$",
+  "_WatchFileName": "EXACT filename only. Chrome dedupe variants like 'files (1).zip' are NOT processed by design -- see README 'Why only files.zip'.",
+  "WatchFileName": "files.zip",
+  "_OrphanWarnPattern": "If a dedupe variant is seen at startup we log a WARN (it means the watcher was down) but take no action.",
+  "OrphanWarnPattern": "^files \\(\\d+\\)\\.zip$",
 
-  "_TimestampFormat": ".NET format string. Default yyyy-MM-dd-HH-mm -> files-2026-08-05-18-42.zip. See README 'Timestamp format' before changing.",
+  "_TimestampFormat": ".NET format string. yyyy-MM-dd-HH-mm -> files-2026-08-05-19-32.zip",
   "TimestampFormat": "yyyy-MM-dd-HH-mm",
   "RenamePrefix": "files-",
 
   "KeepZipAfterExtract": true,
   "Overwrite": true,
 
-  "_tuning": "Completion detection. StableSeconds x StableChecks = minimum quiet period before a download is considered done.",
+  "_tuning": "StableSeconds x StableChecks = minimum quiet period before a download counts as complete.",
   "StableSeconds": 2,
   "StableChecks": 3,
-  "PollSeconds": 5,
+
+  "_PollSeconds": "Safety net ONLY -- detection is event-driven, so this can be long. 300s keeps idle wakeups to 12/hour. Lower it only if you distrust FileSystemWatcher.",
+  "PollSeconds": 300,
   "SettleTimeoutSeconds": 900,
 
   "LogDir": "%LOCALAPPDATA%\\FilesZipWatcher\\logs",

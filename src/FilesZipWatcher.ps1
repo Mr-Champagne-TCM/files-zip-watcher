@@ -4,23 +4,26 @@
     extracts it flat into Downloads.
 
 .DESCRIPTION
-    Long-running watcher. For every completed download named `files.zip` (or Chrome's dedupe
-    variants `files (1).zip`, `files (2).zip`, ...):
+    Long-running, low-power watcher. For a completed download named exactly `files.zip`:
 
-        1. Waits until the download is genuinely finished (see Test-DownloadComplete).
-        2. Renames it to  files-<timestamp>.zip   (default: files-2026-08-05-18-42.zip)
+        1. Waits until the download is genuinely finished (see Wait-DownloadComplete).
+        2. Renames it to  files-<timestamp>.zip   (default: files-2026-08-05-19-32.zip)
         3. Extracts the archive contents into the watch folder itself -- NOT into a subfolder.
         4. Overwrites any colliding files.
         5. Keeps the renamed .zip (configurable).
 
     Everything else in the folder is ignored.
 
+    LOW-POWER DESIGN: detection is event-driven (FileSystemWatcher filtered to the single
+    filename). The safety-net sweep is an O(1) Test-Path on one known path -- it never
+    enumerates the directory -- and runs infrequently (default every 5 minutes). Idle CPU is
+    effectively zero and the working set is trimmed after every wake.
+
 .PARAMETER ConfigPath
     Path to config.json. Defaults to ..\config.json relative to this script.
 
 .PARAMETER Once
-    Process anything already sitting in the watch folder, then exit. Used by tests and for
-    manual catch-up runs. Without it, the script runs forever.
+    Process anything already present, then exit. Used by tests and manual catch-up runs.
 
 .NOTES
     Repo    : https://github.com/Mr-Champagne-TCM/files-zip-watcher
@@ -37,6 +40,21 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+# Working-set trimmer: returns pages to the OS after each wake so an idle watcher
+# holds ~10-15 MB instead of the ~60 MB PowerShell startup footprint.
+if (-not ('FZW.Native' -as [type])) {
+    Add-Type -Namespace FZW -Name Native -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("psapi.dll")]
+public static extern bool EmptyWorkingSet(System.IntPtr hProcess);
+'@
+}
+function Compress-Footprint {
+    try {
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        [void][FZW.Native]::EmptyWorkingSet([Diagnostics.Process]::GetCurrentProcess().Handle)
+    } catch { }
+}
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -47,17 +65,19 @@ function Get-WatcherConfig {
     $defaults = [ordered]@{
         WatchFolder     = (Join-Path $env:USERPROFILE 'Downloads')
         ExtractTo       = (Join-Path $env:USERPROFILE 'Downloads')
-        # Matches files.zip and Chrome's dedupe variants: "files (1).zip"
-        MatchPattern    = '^files(?: \(\d+\))?\.zip$'
-        # NOTE: yyyy-MM-dd-HH-mm. The original request said YYYY-DD-HH-MM (no month),
-        # which collides across months -- see README "Timestamp format".
+        # EXACT filename only. Chrome dedupe variants are deliberately NOT processed --
+        # if the watcher is healthy the archive is renamed within seconds, so Chrome never
+        # needs to create "files (1).zip". Seeing one means we were down; we warn instead.
+        WatchFileName   = 'files.zip'
+        OrphanWarnPattern = '^files \(\d+\)\.zip$'
+        # yyyy-MM-dd-HH-mm  ->  files-2026-08-05-19-32.zip
         TimestampFormat = 'yyyy-MM-dd-HH-mm'
         RenamePrefix    = 'files-'
         KeepZipAfterExtract = $true
         Overwrite       = $true
         StableSeconds   = 2      # size must hold steady this long
         StableChecks    = 3      # ...across this many consecutive samples
-        PollSeconds     = 5      # safety-net sweep interval
+        PollSeconds     = 300    # safety-net only; FileSystemWatcher does the real work
         SettleTimeoutSeconds = 900   # give up waiting on a stalled download
         LogDir          = (Join-Path $env:LOCALAPPDATA 'FilesZipWatcher\logs')
         LogRetentionDays = 30
@@ -73,7 +93,6 @@ function Get-WatcherConfig {
         }
     }
 
-    # Expand any environment variables used in path settings
     foreach ($k in 'WatchFolder','ExtractTo','LogDir') {
         $defaults[$k] = [Environment]::ExpandEnvironmentVariables([string]$defaults[$k])
     }
@@ -93,7 +112,6 @@ function Initialize-Log {
     }
     $script:LogFile = Join-Path $Config.LogDir ("watcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 
-    # Prune old logs
     Get-ChildItem $Config.LogDir -Filter 'watcher-*.log' -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1 * [int]$Config.LogRetentionDays) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
@@ -116,7 +134,6 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 
 function Test-FileLocked {
-    <# Returns $true while another process (Chrome) still holds the file open. #>
     param([string]$Path)
     try {
         $fs = [IO.File]::Open($Path, 'Open', 'Read', 'None')   # exclusive
@@ -129,7 +146,7 @@ function Test-ValidZip {
     param([string]$Path)
     try {
         $z = [IO.Compression.ZipFile]::OpenRead($Path)
-        $null = @($z.Entries).Count      # force central-directory read
+        $null = @($z.Entries).Count
         $z.Dispose()
         return $true
     } catch { return $false }
@@ -137,12 +154,8 @@ function Test-ValidZip {
 
 function Wait-DownloadComplete {
     <#
-        A download is "complete" when ALL of these hold:
-          * no sibling .crdownload part file for it
-          * byte size unchanged across N consecutive samples
-          * the file can be opened exclusively (Chrome has released its handle)
-          * it parses as a valid zip archive
-        Returns $true on success, $false on timeout/abandonment.
+        Complete when ALL hold: no .crdownload sibling; byte size unchanged across N samples;
+        file opens exclusively (Chrome released its handle); parses as a valid zip.
     #>
     param([string]$Path, $Config)
 
@@ -156,9 +169,7 @@ function Wait-DownloadComplete {
             return $false
         }
 
-        # Chrome's in-progress part file sits next to the target.
-        $part = "$Path.crdownload"
-        if (Test-Path $part) { $stable = 0; Start-Sleep -Seconds ([int]$Config.StableSeconds); continue }
+        if (Test-Path "$Path.crdownload") { $stable = 0; Start-Sleep -Seconds ([int]$Config.StableSeconds); continue }
 
         try { $size = (Get-Item $Path -Force).Length } catch { Start-Sleep -Seconds 1; continue }
 
@@ -167,7 +178,7 @@ function Wait-DownloadComplete {
         if ($stable -ge [int]$Config.StableChecks) {
             if (Test-FileLocked $Path) { $stable = 0 }
             elseif (Test-ValidZip $Path) { return $true }
-            else { $stable = 0 }   # size settled but not a readable zip yet
+            else { $stable = 0 }
         }
         Start-Sleep -Seconds ([int]$Config.StableSeconds)
     }
@@ -181,7 +192,6 @@ function Wait-DownloadComplete {
 # ---------------------------------------------------------------------------
 
 function Get-TimestampedName {
-    <# files-<stamp>.zip, with -1/-2 suffixes if that name is already taken. #>
     param([string]$Folder, $Config)
 
     $stamp = Get-Date -Format $Config.TimestampFormat
@@ -197,9 +207,8 @@ function Get-TimestampedName {
 
 function Expand-ArchiveFlat {
     <#
-        Extracts into $Destination, preserving the archive's internal folder structure but
-        NOT creating a wrapper folder. Overwrites collisions when configured.
-        Refuses entries that would escape the destination (zip-slip protection).
+        Extract into $Destination preserving the archive's internal folder structure but with
+        NO wrapper folder. Overwrites when configured. Refuses zip-slip entries.
     #>
     param([string]$ZipPath, [string]$Destination, $Config)
 
@@ -209,8 +218,7 @@ function Expand-ArchiveFlat {
     $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
         foreach ($entry in $zip.Entries) {
-            # Directory entries have empty Name
-            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }   # directory entry
 
             $rel = $entry.FullName -replace '/', '\'
             if ($rel -match '^[\\/]' -or $rel -match '^[A-Za-z]:' -or $rel -split '\\' -contains '..') {
@@ -249,37 +257,31 @@ function Expand-ArchiveFlat {
 function Invoke-ProcessZip {
     param([string]$Path, $Config)
 
-    $name = Split-Path $Path -Leaf
-    Write-Log "Detected: $name"
+    Write-Log "Detected: $(Split-Path $Path -Leaf)"
 
     if (-not (Wait-DownloadComplete -Path $Path -Config $Config)) { return }
 
     $sizeMB = [math]::Round((Get-Item $Path -Force).Length / 1MB, 2)
     Write-Log "Download complete ($sizeMB MB). Processing."
 
-    # 1) Rename with timestamp
     $newPath = Get-TimestampedName -Folder (Split-Path $Path -Parent) -Config $Config
     try {
         Move-Item -LiteralPath $Path -Destination $newPath -Force
         Write-Log "Renamed  -> $(Split-Path $newPath -Leaf)" 'OK'
     } catch {
-        Write-Log "Rename failed: $($_.Exception.Message)" 'ERROR'
-        return
+        Write-Log "Rename failed: $($_.Exception.Message)" 'ERROR'; return
     }
 
-    # 2) Extract flat into the target folder
     try {
         $r = Expand-ArchiveFlat -ZipPath $newPath -Destination $Config.ExtractTo -Config $Config
         Write-Log ("Extracted-> {0}  (new {1}, overwritten {2}, skipped {3}, errors {4})" -f `
                    $Config.ExtractTo, $r.Extracted, $r.Overwritten, $r.Skipped, $r.Errors) 'OK'
     } catch {
-        Write-Log "Extract failed: $($_.Exception.Message)" 'ERROR'
-        return
+        Write-Log "Extract failed: $($_.Exception.Message)" 'ERROR'; return
     }
 
-    # 3) Optionally discard the archive
     if (-not $Config.KeepZipAfterExtract) {
-        try { Remove-Item -LiteralPath $newPath -Force; Write-Log "Removed archive (KeepZipAfterExtract=false)" }
+        try { Remove-Item -LiteralPath $newPath -Force; Write-Log 'Removed archive (KeepZipAfterExtract=false)' }
         catch { Write-Log "Could not remove archive: $($_.Exception.Message)" 'WARN' }
     }
 }
@@ -301,59 +303,82 @@ if (-not (Test-Path $Config.ExtractTo)) {
     New-Item -ItemType Directory -Force -Path $Config.ExtractTo | Out-Null
 }
 
-# Single-instance guard -- a second copy would double-process the same archive.
-$mutex = New-Object System.Threading.Mutex($false, 'Global\FilesZipWatcher_SingleInstance')
+# Single-instance guard, scoped PER WATCH FOLDER.
+# A global name would (and did) block the sandboxed self-test and any manual -Once catch-up
+# run whenever the installed service was live. Two watchers on *different* folders are fine;
+# two on the *same* folder would double-process.
+$folderKey = ([Security.Cryptography.MD5]::Create().ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($Config.WatchFolder.ToLowerInvariant().TrimEnd('\'))
+             ) | ForEach-Object { $_.ToString('x2') }) -join ''
+$mutexName = "Global\FilesZipWatcher_$($folderKey.Substring(0,16))"
+try   { $mutex = New-Object System.Threading.Mutex($false, $mutexName) }
+catch { $mutex = New-Object System.Threading.Mutex($false, "Local\FilesZipWatcher_$($folderKey.Substring(0,16))") }
+
 if (-not $mutex.WaitOne(0)) {
-    Write-Log 'Another instance is already running. Exiting.' 'WARN'
+    Write-Log "Another watcher is already running for '$($Config.WatchFolder)'. Exiting." 'WARN'
     exit 0
 }
 
-Write-Log ("=== FilesZipWatcher starting ===")
-Write-Log ("Watch     : {0}" -f $Config.WatchFolder)
+# The single path we care about. O(1) checks -- never a directory enumeration.
+$script:TargetPath = Join-Path $Config.WatchFolder $Config.WatchFileName
+$script:Busy = $false
+
+Write-Log '=== FilesZipWatcher starting ==='
+Write-Log ("Watching  : {0}" -f $script:TargetPath)
 Write-Log ("Extract to: {0}" -f $Config.ExtractTo)
-Write-Log ("Pattern   : {0}" -f $Config.MatchPattern)
 Write-Log ("Stamp fmt : {0}  (e.g. {1})" -f $Config.TimestampFormat, (Get-Date -Format $Config.TimestampFormat))
-Write-Log ("Mode      : {0}" -f $(if ($Once) { 'ONCE (sweep then exit)' } else { 'CONTINUOUS' }))
+Write-Log ("Power     : event-driven; safety sweep every {0}s" -f $Config.PollSeconds)
 
-$script:InFlight = New-Object 'System.Collections.Generic.HashSet[string]'
-
-function Invoke-Sweep {
+function Invoke-Check {
     param($Config)
-    Get-ChildItem -LiteralPath $Config.WatchFolder -Filter '*.zip' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $Config.MatchPattern } |
-        ForEach-Object {
-            $full = $_.FullName
-            if ($script:InFlight.Contains($full)) { return }
-            [void]$script:InFlight.Add($full)
-            try { Invoke-ProcessZip -Path $full -Config $Config }
-            catch { Write-Log "Unhandled error on '$($_.Exception.Message)'" 'ERROR' }
-            finally { [void]$script:InFlight.Remove($full) }
+    if ($script:Busy) { return }
+    if (-not (Test-Path -LiteralPath $script:TargetPath)) { return }
+    $script:Busy = $true
+    try     { Invoke-ProcessZip -Path $script:TargetPath -Config $Config }
+    catch   { Write-Log "Unhandled error: $($_.Exception.Message)" 'ERROR' }
+    finally { $script:Busy = $false; Compress-Footprint }
+}
+
+function Write-OrphanWarning {
+    <#
+        A "files (1).zip" means Chrome had to dedupe -- i.e. the watcher was NOT running when
+        that download landed. We deliberately do not process it (exact-name-only policy), but
+        we say so loudly instead of letting it rot unnoticed.
+    #>
+    param($Config)
+    try {
+        $orphans = Get-ChildItem -LiteralPath $Config.WatchFolder -Filter 'files (*.zip' -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -match $Config.OrphanWarnPattern }
+        foreach ($o in $orphans) {
+            Write-Log ("Orphan found (watcher was down when it arrived): '{0}'. Not processed -- exact-name policy. Rename it to '{1}' to have it handled." -f $o.Name, $Config.WatchFileName) 'WARN'
         }
+    } catch { }
 }
 
 try {
-    # Catch anything that landed while we were not running.
-    Invoke-Sweep -Config $Config
+    Write-OrphanWarning -Config $Config     # startup only: one directory read, then never again
+    Invoke-Check -Config $Config            # catch up on anything already sitting there
 
     if ($Once) { Write-Log 'ONCE mode complete.'; exit 0 }
 
-    # FileSystemWatcher gives instant reaction; the poll loop is the safety net for
-    # missed/coalesced events and for files that appear during a restart.
-    $fsw = New-Object IO.FileSystemWatcher $Config.WatchFolder, '*.zip'
+    # Filtered to the single filename -- the OS only signals us for this exact name.
+    $fsw = New-Object IO.FileSystemWatcher $Config.WatchFolder, $Config.WatchFileName
     $fsw.IncludeSubdirectories = $false
-    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size
+    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::Size
     $fsw.EnableRaisingEvents = $true
 
     Register-ObjectEvent $fsw Created -SourceIdentifier FZW_Created | Out-Null
     Register-ObjectEvent $fsw Renamed -SourceIdentifier FZW_Renamed | Out-Null
 
-    Write-Log 'Watching. (Ctrl+C to stop when run interactively.)' 'OK'
+    Compress-Footprint
+    Write-Log 'Watching. Idle until files.zip appears.' 'OK'
 
     while ($true) {
-        # Wait for an event, but wake up regularly to run the safety-net sweep.
+        # Blocks (no CPU) until an event fires or the long safety timeout elapses.
         $evt = Wait-Event -Timeout ([int]$Config.PollSeconds)
         if ($evt) { Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue }
-        Invoke-Sweep -Config $Config
+        Invoke-Check -Config $Config
+        if (-not $evt) { Compress-Footprint }   # periodic trim on the quiet path
     }
 }
 catch {

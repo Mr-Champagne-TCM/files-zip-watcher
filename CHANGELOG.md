@@ -3,6 +3,41 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] — 2026-08-05
+
+Power/footprint pass and exact-name policy, per feedback after the v1.0.0 live install.
+
+### Changed
+- **Exact filename only.** `MatchPattern` (regex, matched dedupe variants) replaced by
+  `WatchFileName` (default `files.zip`). Chrome's `files (1).zip` variants are no longer
+  processed — rationale in README → *Why only `files.zip`*: a healthy watcher renames the archive
+  within seconds, so a variant existing at all means the watcher was down.
+- **Hot path is now O(1).** The safety-net check is a single `Test-Path` on one known path
+  instead of enumerating and regex-filtering every `*.zip` in the folder.
+- **`PollSeconds` default 5 → 300.** Detection is event-driven (`FileSystemWatcher` filtered to
+  the single filename), so the poll is a pure safety net. Timer wakeups: 720/hr → 12/hr.
+- **Single-instance mutex is now scoped per watch folder** (was one global name).
+
+### Added
+- Working-set trimming (`EmptyWorkingSet`) after startup, after each processed archive, and on
+  each quiet wake.
+- Orphan warning: `files (N).zip` present at startup logs a WARN naming the file and how to have
+  it handled, instead of being silently ignored.
+- Two more self-test assertions (13 total) covering the dedupe-variant refusal and its warning.
+
+### Fixed
+- **Global mutex locked out the self-test and manual `-Once` runs** whenever the installed
+  service was live — the second instance exited with "Another instance is already running" even
+  when pointed at a completely different folder. Now scoped by a hash of the watch folder path.
+
+### Measured (steady-state idle, startup excluded)
+| | Idle CPU | RAM | Wakes/hr |
+|---|---|---|---|
+| 1.0.0 | 0.33 % | 63 MB | 720 |
+| 1.1.0 | 0.078 % | 18 MB | 12 |
+
+≈22.5 CPU-seconds per 8-hour day.
+
 ## [1.0.0] — 2026-08-05
 
 Initial release.

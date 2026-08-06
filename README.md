@@ -14,10 +14,20 @@ When one lands, it:
 Everything else in the folder is ignored.
 
 ```
-~/Downloads/files.zip                    ~/Downloads/files-2026-08-05-18-42.zip
+~/Downloads/files.zip                    ~/Downloads/files-2026-08-05-19-32.zip
       (contains a.txt, sub/b.txt)   ->   ~/Downloads/a.txt
                                          ~/Downloads/sub/b.txt
 ```
+
+**Runs light — measured, not estimated:**
+
+| | Idle CPU | RAM | Timer wakes/hr |
+|---|---|---|---|
+| v1.0.0 | 0.33 % | 63 MB | 720 |
+| **v1.1.0** | **0.078 %** | **18 MB** | **12** |
+
+That's **22.5 CPU-seconds per 8-hour day** — no perceptible battery impact. See
+[Running light](#running-light).
 
 ---
 
@@ -96,6 +106,58 @@ was stopped, so a reboot mid-download still gets handled.
 
 ---
 
+## Running light
+
+Design goal: **zero perceptible battery drain**. Three things get it there.
+
+**1. It never enumerates the folder.** Because only the exact name `files.zip` is of interest,
+the safety-net check is a single `Test-Path` on one known path — O(1), regardless of how many
+thousands of files live in Downloads. v1.0.0 listed and regex-filtered every `*.zip` in the
+folder 720 times an hour; that was essentially all of its CPU cost.
+
+**2. Detection is event-driven, so the timer can be slow.** The `FileSystemWatcher` is filtered
+to the single filename, so the OS only signals the process for that one name — reaction is
+immediate. The poll loop is therefore a pure safety net (for FSW's known event-dropping under
+buffer pressure, and for archives that land while the watcher is stopped), and runs every
+**300 s** instead of 5 s. `Wait-Event -Timeout` genuinely blocks; it is not a spin loop.
+
+**3. The working set is trimmed after every wake.** `EmptyWorkingSet` returns pages to the OS
+after startup, after each processed archive, and on each quiet-path wake, which is what takes
+resident memory from ~60 MB down to ~18 MB.
+
+Measured on this machine (steady-state delta over 180 s, startup cost excluded):
+
+```
+Idle CPU : 0.0781 % of one core   ->  22.5 CPU-seconds per 8-hour day
+RAM      : 18.5 MB working set
+Wakeups  : 12/hour
+Priority : BelowNormal
+```
+
+If you want it even quieter, raise `PollSeconds` — the event watcher still catches everything
+promptly; you are only lengthening the safety net.
+
+## Why only `files.zip`
+
+Only the **exact** filename is processed. Chrome's dedupe variants — `files (1).zip`,
+`files (2).zip` — are deliberately **not** handled, for the reason you'd hope:
+
+> If the watcher is healthy, `files.zip` is renamed within seconds of the download finishing,
+> so Chrome never has a reason to create a `(1)` variant in the first place.
+
+A variant appearing therefore *means something*: the watcher was down when that download landed.
+Silently processing it would hide that. Instead, on startup the watcher does one directory read,
+and logs a warning for each orphan it finds:
+
+```
+[WARN ] Orphan found (watcher was down when it arrived): 'files (1).zip'.
+        Not processed -- exact-name policy. Rename it to 'files.zip' to have it handled.
+```
+
+Rename it and the watcher picks it up immediately. To process variants automatically anyway, set
+`WatchFileName` to a name you control — but note the tool matches one exact name by design, which
+is what keeps the hot path O(1).
+
 ## Timestamp format
 
 > ⚠️ **Note on the original spec.** The request specified `YYYY-DD-HH-MM`, which has **no month**.
@@ -123,13 +185,14 @@ After editing, apply with `.\install.ps1 -Restart`.
 |---|---|---|
 | `WatchFolder` | `%USERPROFILE%\Downloads` | Folder to watch |
 | `ExtractTo` | `%USERPROFILE%\Downloads` | Where contents land (no wrapper folder) |
-| `MatchPattern` | `^files(?: \(\d+\))?\.zip$` | Regex on **file name**. Matches `files.zip` **and** Chrome's dedupe variants `files (1).zip` |
+| `WatchFileName` | `files.zip` | **Exact** filename. See [Why only `files.zip`](#why-only-fileszip) |
+| `OrphanWarnPattern` | `^files \(\d+\)\.zip$` | Variants matching this get a startup WARN, never processed |
 | `TimestampFormat` | `yyyy-MM-dd-HH-mm` | See above |
 | `RenamePrefix` | `files-` | Prefix for the renamed archive |
 | `KeepZipAfterExtract` | `true` | `false` deletes the archive after a successful extract |
 | `Overwrite` | `true` | `false` skips colliding files instead |
 | `StableSeconds` / `StableChecks` | `2` / `3` | Quiet period before "complete" |
-| `PollSeconds` | `5` | Safety-net sweep interval |
+| `PollSeconds` | `300` | Safety-net interval. Detection is event-driven, so long is fine |
 | `SettleTimeoutSeconds` | `900` | Give up on a stalled download |
 | `LogDir` | `%LOCALAPPDATA%\FilesZipWatcher\logs` | Log location |
 | `LogRetentionDays` | `30` | Older logs auto-pruned |
@@ -174,8 +237,12 @@ A processed archive looks like:
 
 Runs entirely in a temp sandbox — **it never touches your real Downloads folder**. It builds a
 synthetic `files.zip` (plain file, nested folder, a deliberate collision, and a zip-slip attack
-entry) and asserts 11 behaviours including flat extraction, overwrite, no wrapper folder,
-traversal refusal, and that non-matching zips are ignored.
+entry) and asserts **13** behaviours including flat extraction, overwrite, no wrapper folder,
+traversal refusal, non-matching zips ignored, and that a `files (1).zip` variant is refused *and*
+raises the orphan warning.
+
+The single-instance mutex is scoped **per watch folder**, so the self-test and manual `-Once`
+runs work normally while the installed service is live.
 
 Manual catch-up run without installing anything:
 

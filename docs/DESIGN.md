@@ -109,6 +109,52 @@ The requirement said "rename … then unzip", not "delete". Keeping it makes the
 (you retain a timestamped record of each session's payload) and makes re-extraction possible.
 `KeepZipAfterExtract: false` for anyone who disagrees.
 
+### 10. Exact filename only, and why the variants are a *signal* (v1.1.0)
+
+v1.0.0 matched `files.zip` **and** Chrome's `files (1).zip` dedupe variants, on the theory that
+being permissive was safer. That was backwards.
+
+If the watcher is healthy, `files.zip` is renamed within seconds of the download completing —
+so **Chrome never has a reason to create a variant**. A variant existing is therefore evidence
+that the watcher was down when that download landed. Processing it silently would erase that
+signal. So: exact name only, and a startup WARN naming any orphan found.
+
+This also made the hot path O(1) — see decision 11.
+
+### 11. Power budget (v1.1.0)
+
+The v1.0.0 measurement on the real machine: **0.33 % CPU, 63 MB RAM, 720 timer wakes/hour**. The
+CPU was almost entirely `Get-ChildItem -Filter *.zip` + regex, running every 5 seconds against a
+Downloads folder with hundreds of files.
+
+Three changes, in order of payoff:
+
+1. **O(1) check.** With an exact filename, the safety net is one `Test-Path`. Folder size stopped
+   mattering. This removed most of the CPU.
+2. **Slow the timer.** `FileSystemWatcher` is filtered to the single name, so the OS wakes us only
+   for that file — reaction stays instant while the poll drops 5 s → 300 s. `Wait-Event -Timeout`
+   blocks properly, so idle really is idle.
+3. **Trim the working set.** `psapi!EmptyWorkingSet` after startup / after each archive / on each
+   quiet wake. PowerShell's ~60 MB startup footprint is mostly cold pages it never touches again;
+   returning them takes resident memory to ~18 MB.
+
+Result: **0.078 % CPU, 18 MB, 12 wakes/hour** ≈ 22.5 CPU-seconds per 8-hour day.
+
+Floor for further gains is the PowerShell host itself. Going meaningfully below ~18 MB would mean
+rewriting the watcher as a small compiled C# service — noted under *Possible next steps*, but not
+worth it at this consumption.
+
+### 12. Mutex scoping bug (found by the v1.1.0 test run)
+
+The v1.0.0 single-instance guard used one global name, `FilesZipWatcher_SingleInstance`. Once the
+service was installed and running, **every** other invocation exited immediately — including the
+sandboxed self-test pointed at a completely different folder, and any manual `-Once` catch-up run.
+The test suite went from 11/11 to 0/11 purely because the service was live.
+
+Now the mutex name embeds an MD5 of the normalised watch-folder path. Two watchers on different
+folders coexist; two on the same folder still cannot. Worth remembering: **a correctness guard
+that also blocks your own tests is a bug, not a safety feature.**
+
 ## Known limitations
 
 - **Interactive-session scope** by default (see decision 1).

@@ -62,7 +62,7 @@ try {
     $cfg = Join-Path $sandbox 'config.json'
     @{
         WatchFolder = $watch; ExtractTo = $watch; LogDir = $logs
-        MatchPattern = '^files(?: \(\d+\))?\.zip$'
+        WatchFileName = 'files.zip'; OrphanWarnPattern = '^files \(\d+\)\.zip$'
         TimestampFormat = 'yyyy-MM-dd-HH-mm'; RenamePrefix = 'files-'
         KeepZipAfterExtract = $true; Overwrite = $true
         StableSeconds = 1; StableChecks = 1; PollSeconds = 1; SettleTimeoutSeconds = 60
@@ -93,6 +93,12 @@ try {
     Copy-Item $renamed[0].FullName (Join-Path $watch 'somethingelse.zip')
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once | Out-Null
     Assert-That 'non-matching zip ignored'              (Test-Path (Join-Path $watch 'somethingelse.zip'))
+
+    # Chrome dedupe variant must be IGNORED (exact-name policy) but WARNED about
+    Copy-Item $renamed[0].FullName (Join-Path $watch 'files (1).zip')
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once 2>&1 | Out-String
+    Assert-That 'dedupe variant NOT processed'          (Test-Path (Join-Path $watch 'files (1).zip'))
+    Assert-That 'dedupe variant raises orphan WARN'     ($out -match 'Orphan found')
 
     Write-Host ""
     if ($fail -eq 0) { Write-Host "ALL $pass CHECKS PASSED" -ForegroundColor Green }
