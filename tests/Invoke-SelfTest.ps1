@@ -133,6 +133,14 @@ try {
     $logtext = Get-Content (Get-ChildItem $logs -Filter '*.log' | Select-Object -First 1).FullName -Raw
     Assert-That 'overwrites logged by name'            ($logtext -match '~ collide\.txt')
 
+    # the printed count and the number of named lines must AGREE - a count that outruns the
+    # list is exactly what a truncated/abbreviated report looks like.
+    $loglines = Get-Content (Get-ChildItem $logs -Filter '*.log' | Select-Object -First 1).FullName
+    $declared = 0
+    foreach ($l in $loglines) { if ($l -match 'OVERWROTE (\d+) existing file') { $declared += [int]$Matches[1] } }
+    $named = @($loglines | Where-Object { $_ -match '\s~ ' }).Count
+    Assert-That 'overwrite count == number of names listed' ($declared -eq $named) "declared $declared, named $named"
+
     # post-extract verification must actually FAIL when the bytes on disk are wrong.
     # Simulate a bad write by making the destination read-only so the write is refused,
     # then by corrupting a file the archive will overwrite and checking it is corrected.

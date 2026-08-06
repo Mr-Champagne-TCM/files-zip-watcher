@@ -26,7 +26,7 @@ with nothing in the log but the number `8`.
 - Archive is **retained even when `KeepZipAfterExtract: false`** if any file failed verification —
   it is then the only trustworthy copy.
 - Config: `WriteManifest` (default `true`), `ManifestExtension` (default `.sha256`).
-- Self-test grown 13 → 22 assertions covering the manifest, its format, hash-vs-disk agreement,
+- Self-test grown 13 → 23 assertions covering the manifest, its format, hash-vs-disk agreement,
   by-name overwrite logging, and LF termination.
 
 ### Fixed

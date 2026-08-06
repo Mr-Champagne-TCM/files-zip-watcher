@@ -168,15 +168,32 @@ a corrupt archive already throws. What is verified here is **the write**: trunca
 a process kill mid-write, or something touching the file right after we close it (AV quarantine, a
 sync client, a second writer).
 
-**Overwrites are named, not counted.** A bare `overwritten 8` tells you nothing at 3 a.m.:
+**Overwrites are named, not counted.** A bare `overwritten 8` tells you nothing at 3 a.m.
+**Every** replaced file gets its own line — the count and the list always agree:
 
 ```
+[OK   ] Extracted-> C:\Users\jerem\Downloads  (new 0, overwritten 15, skipped 0, errors 0, verify-failed 0)
 [WARN ] OVERWROTE 15 existing file(s):
+[WARN ]     ~ CLAUDE_CODE_PROMPT_2026-08-05F-v2.md
+[WARN ]     ~ ADDENDUM_2026-08-05F-4.md
+[WARN ]     ~ hashes_05F.txt
 [WARN ]     ~ mockup_gen.py
 [WARN ]     ~ MU16_frame_param.svg
+[WARN ]     ~ MU12_side_param.svg
+[WARN ]     ~ MU13_front_param.svg
+[WARN ]     ~ MU14_back_param.svg
+[WARN ]     ~ MU15_bottom_param.svg
+[WARN ]     ~ verify_sheets.py
+[WARN ]     ~ verify_junctions.py
+[WARN ]     ~ ADDENDUM_2026-08-05F-3.md
+[WARN ]     ~ ADDENDUM_2026-08-05F-2.md
+[WARN ]     ~ ADDENDUM_2026-08-05F.md
+[WARN ]     ~ CAPTURE_NOTE_2026-08-05F.md
 [OK   ] Integrity: all 15 extracted file(s) verified against their decompressed hash
 [OK   ] Manifest -> files-2026-08-05-21-28.sha256  (15 files + archive)
 ```
+
+(Real output from 2026-08-05 21:28, unabridged.)
 
 ## Running light
 
@@ -311,7 +328,7 @@ A processed archive looks like:
 
 Runs entirely in a temp sandbox — **it never touches your real Downloads folder**. It builds a
 synthetic `files.zip` (plain file, nested folder, a deliberate collision, and a zip-slip attack
-entry) and asserts **22** behaviours including flat extraction, overwrite, no wrapper folder,
+entry) and asserts **23** behaviours including flat extraction, overwrite, no wrapper folder,
 traversal refusal, non-matching zips ignored, and that a `files (1).zip` variant is refused *and*
 raises the orphan warning.
 
