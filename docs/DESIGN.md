@@ -35,6 +35,42 @@ anyone who later needs it.
 while logged out, the default install won't see it until logon. Deemed irrelevant for the use
 case.
 
+#### 1a. "But downloads finish while the desktop is LOCKED — isn't that the same as logged out?"
+
+Raised by Jeremy 2026-08-05. It is a fair question and the answer is **no** — and the distinction
+is what makes the logon-scoped task sufficient.
+
+| State | Session | Chrome / Claude Desktop | Watcher | Coverage |
+|---|---|---|---|---|
+| **Locked** (Win+L) | alive | running, downloads complete | running in that same session | ✅ full |
+| **Signed out** | destroyed | terminated — cannot download | not running | ✅ nothing to miss |
+| **Sleep / hibernate** | suspended | suspended with everything else | resumes on wake; sweep catches it | ✅ |
+| **Fast user switch** | alive in background | running | running | ✅ |
+
+Locking the workstation does not suspend processes — it only secures the desktop. The user
+session, Chrome, and the watcher all keep running, so an archive that lands at 3 a.m. behind a
+lock screen is renamed and extracted at 3 a.m.
+
+Verified on the installed task (2026-08-05), since a wrong setting here would silently break it:
+
+```
+RunOnlyIfIdle             : False    # True would suspend it whenever you returned to the machine
+IdleSettings.StopOnIdleEnd: False    # True would kill it on unlock
+ExecutionTimeLimit        : none
+LogonType                 : Interactive   # lives with the session, survives lock
+Process                   : session 1 (interactive), State=Running
+```
+
+**This also covers Claude Desktop** (and Edge, curl, or anything else) writing into the folder
+while locked — and not by luck. Of the four completion checks, only the `.crdownload` sibling is
+Chrome-specific; **stable size**, **exclusive open**, and **valid zip parse** are writer-agnostic.
+A downloader that never creates a part file simply satisfies the other three.
+
+**The only thing the logon-scoped task genuinely misses** is a writer running *outside* the
+interactive session — a SYSTEM service, a different user's session, or a scheduled job dropping
+`files.zip` while nobody is signed in. Nothing in the current workflow does that. If that ever
+changes, `install.ps1 -AtBoot` from an elevated prompt is the answer.
+
 ### 2. Completion detection is four-layered
 
 The single biggest failure mode of a naive `FileSystemWatcher` is firing on `Created`, which
@@ -157,7 +193,9 @@ that also blocks your own tests is a bug, not a safety feature.**
 
 ## Known limitations
 
-- **Interactive-session scope** by default (see decision 1).
+- **Interactive-session scope** by default (see decisions 1 and 1a). Covers locked desktops and
+  any in-session downloader (Chrome, Claude Desktop, ...); does NOT cover a writer running while
+  nobody is signed in.
 - **No content dedupe.** Two identical `files.zip` downloads produce two timestamped archives and
   overwrite the same extracted files. Deliberate — matches the "overwrite collisions" requirement.
 - **Minute resolution.** Two archives completing in the same minute get `-1` suffixes. Bump to

@@ -85,6 +85,32 @@ processes archives even if both triggers fire.
 
 ---
 
+### Does it still work when the desktop is locked?
+
+**Yes — locked is not the same as signed out.** Locking secures the desktop; it does not suspend
+your session. Chrome (and Claude Desktop) keep running and downloads complete, and the watcher is
+running in that same session, so an archive landing at 3 a.m. behind a lock screen is processed
+at 3 a.m.
+
+| State | Downloads happen? | Watcher running? | Covered |
+|---|---|---|---|
+| Locked | yes | yes | ✅ |
+| Signed out | no — the browser is gone too | no | ✅ nothing to miss |
+| Sleep / hibernate | suspended | resumes on wake, sweep catches up | ✅ |
+
+Confirmed on the installed task: `RunOnlyIfIdle=False`, `StopOnIdleEnd=False`, no execution time
+limit, `LogonType=Interactive`, process in interactive session 1.
+
+The only genuine gap is a writer running *outside* your interactive session — a SYSTEM service or
+a scheduled job dropping `files.zip` while nobody is signed in. That is what `install.ps1 -AtBoot`
+is for.
+
+### Does it only work with Chrome?
+
+No. Only one of the four completion checks (the `.crdownload` part file) is Chrome-specific — the
+other three are writer-agnostic. **Claude Desktop**, Edge, Firefox, `curl`, or a file copy all
+work: they simply satisfy stable-size + exclusive-open + valid-zip-parse instead.
+
 ## How "download complete" is detected
 
 This is the part that matters most — extracting a half-written zip is the classic failure of
