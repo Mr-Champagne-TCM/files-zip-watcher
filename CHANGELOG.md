@@ -3,6 +3,61 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] — 2026-08-17
+
+Survivability. Driven by a real three-day outage: the watcher was killed mid-session on 08-14
+(exit `0xC000013A`, an external console-control close — **not** a crash; the script's own error
+path never ran) and **stayed dead until 08-17**, silently missing a download. The machine never
+rebooted in between, and the task's only trigger was `AtLogOn` — so nothing ever restarted it.
+Task Scheduler's configured `RestartOnFailure` did not apply either: Windows recorded the task as
+*completed with an error code*, not *failed to start*.
+
+Diagnosis was also harder than it should have been. `Microsoft-Windows-TaskScheduler/Operational`
+was disabled, and the watcher's log had been silent since the moment it came up — so a **dead**
+watcher and a merely **idle** one produced byte-identical logs.
+
+### Added
+- **Self-heal trigger (`install.ps1 -RepeatMinutes`, default 15).** The task now carries a daily
+  trigger repeating every 15 minutes alongside the logon trigger, so a dead watcher revives itself
+  within one interval instead of waiting for the next sign-in. Redundant starts cost nothing — the
+  per-folder mutex makes a second instance exit 0 immediately, and `MultipleInstances=IgnoreNew`
+  backs it up. The installer **asserts the repetition round-tripped** into the registered task and
+  warns loudly if it did not; that setting is known to come back empty on PS 5.1.
+- **Heartbeat (`HeartbeatMinutes`, default 60).** Writes a periodic `Heartbeat: alive, idle.` line,
+  so a silent log now proves the watcher is **dead** rather than idle, and brackets an unexplained
+  death to within one interval. `0` disables.
+- **Startup catch-up now processes Chrome dedupe orphans** (`ProcessOrphansOnStartup`, default
+  `true`) instead of only warning about them — the orphans exist precisely because the watcher was
+  down, so refusing to process them stranded the very payloads it was supposed to catch.
+  Archives are handled **oldest-first**, so the newest download wins any collision.
+  Set `false` for the 1.1.0–1.2.0 warn-only behaviour.
+
+### Fixed
+- **Log file never rolled past the startup date.** `Initialize-Log` runs once, so a watcher up for
+  days kept writing into the file named for the day it *started*. Harmless when every run was
+  short; fatal to the new heartbeat, which would have filed a Tuesday beat under Monday. `Write-Log`
+  now rolls to today's file.
+- **`-AtBoot` would have silently watched the wrong folder.** It switches the principal to SYSTEM,
+  and since there is only one task the logon trigger runs as SYSTEM too — where `%USERPROFILE%`
+  resolves to `C:\Windows\system32\config\systemprofile`. The watcher would have reported itself
+  perfectly healthy while catching nothing. `install.ps1` now refuses `-AtBoot` unless
+  `WatchFolder`/`ExtractTo` are absolute.
+
+### Not done
+- **Conversion to a real Windows service** was considered and rejected for now. The repeating
+  trigger addresses the same failure at a fraction of the complexity.
+
+### Ordering note
+Catch-up sorts by `LastWriteTime`, and **does not assume `files.zip` is the newest archive** —
+Chrome creates `files (1).zip` only *because* `files.zip` already existed, so the orphan is
+normally the newer download. Sorting by name or processing the exact-name file first would let a
+stale archive overwrite fresher files. Covered by a regression test.
+
+### Self-test
+Grown 23 → **31 assertions**, adding orphan-catch-up on/off, the oldest-first ordering guarantee
+(a genuinely older `files.zip` must lose to a newer `files (1).zip`), and a live heartbeat check
+that runs the real loop and kills it the way the 08-14 death happened.
+
 ## [1.2.0] — 2026-08-05
 
 Provenance and integrity. Driven by a real incident the same day: two `files.zip` payloads landed

@@ -67,6 +67,9 @@ try {
         KeepZipAfterExtract = $true; Overwrite = $true
         StableSeconds = 1; StableChecks = 1; PollSeconds = 1; SettleTimeoutSeconds = 60
         LogRetentionDays = 1
+        # v1.3.0 -- warn-only first so the legacy behaviour stays covered; a second config
+        # below flips it on and asserts the new catch-up.
+        ProcessOrphansOnStartup = $false; HeartbeatMinutes = 0
     } | ConvertTo-Json | Set-Content $cfg -Encoding UTF8
 
     # --- run -------------------------------------------------------------
@@ -94,11 +97,11 @@ try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once | Out-Null
     Assert-That 'non-matching zip ignored'              (Test-Path (Join-Path $watch 'somethingelse.zip'))
 
-    # Chrome dedupe variant must be IGNORED (exact-name policy) but WARNED about
+    # ProcessOrphansOnStartup = false -> dedupe variant IGNORED but WARNED about (legacy behaviour)
     Copy-Item $renamed[0].FullName (Join-Path $watch 'files (1).zip')
     $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once 2>&1 | Out-String
-    Assert-That 'dedupe variant NOT processed'          (Test-Path (Join-Path $watch 'files (1).zip'))
-    Assert-That 'dedupe variant raises orphan WARN'     ($out -match 'Orphan found')
+    Assert-That 'orphans OFF: dedupe variant NOT processed'  (Test-Path (Join-Path $watch 'files (1).zip'))
+    Assert-That 'orphans OFF: raises orphan WARN'            ($out -match 'Orphan found')
 
     # ---- v1.2.0: manifest sidecar + post-extract verification ----------------
     $man = [IO.Path]::ChangeExtension($renamed[0].FullName, '.sha256')
@@ -148,6 +151,75 @@ try {
     Copy-Item $renamed[0].FullName (Join-Path $watch 'files.zip')
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg -Once | Out-Null
     Assert-That 'overwrite restores correct content'   ((Get-Content (Join-Path $watch 'collide.txt') -Raw).Trim() -eq 'FROM_ZIP')
+
+    # ---- v1.3.0 (C): startup catch-up PROCESSES dedupe orphans ---------------
+    $cfg2 = Join-Path $sandbox 'config-orphans.json'
+    @{
+        WatchFolder = $watch; ExtractTo = $watch; LogDir = $logs
+        WatchFileName = 'files.zip'; OrphanWarnPattern = '^files \(\d+\)\.zip$'
+        TimestampFormat = 'yyyy-MM-dd-HH-mm'; RenamePrefix = 'files-'
+        KeepZipAfterExtract = $true; Overwrite = $true
+        StableSeconds = 1; StableChecks = 1; PollSeconds = 1; SettleTimeoutSeconds = 60
+        LogRetentionDays = 1
+        ProcessOrphansOnStartup = $true; HeartbeatMinutes = 0
+    } | ConvertTo-Json | Set-Content $cfg2 -Encoding UTF8
+
+    Assert-That 'orphan still present before catch-up'  (Test-Path (Join-Path $watch 'files (1).zip'))
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg2 -Once | Out-Null
+    Assert-That 'orphans ON: dedupe variant IS processed' (-not (Test-Path (Join-Path $watch 'files (1).zip')))
+
+    # ---- v1.3.0 (C): oldest-first ordering, newest archive wins collisions ---
+    # The real-world case: Chrome creates 'files (1).zip' only BECAUSE 'files.zip' already
+    # existed, so the orphan is the NEWER download. Processing must not assume otherwise.
+    $stageA = Join-Path $sandbox 'stageA'; New-Item -ItemType Directory -Force $stageA | Out-Null
+    Set-Content (Join-Path $stageA 'order.txt') 'OLDER' -Encoding UTF8
+    $zipOld = Join-Path $watch 'files.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($stageA, $zipOld)
+
+    $stageB = Join-Path $sandbox 'stageB'; New-Item -ItemType Directory -Force $stageB | Out-Null
+    Set-Content (Join-Path $stageB 'order.txt') 'NEWER' -Encoding UTF8
+    $zipNew = Join-Path $watch 'files (1).zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($stageB, $zipNew)
+
+    (Get-Item $zipOld).LastWriteTime = (Get-Date).AddHours(-2)
+    (Get-Item $zipNew).LastWriteTime = (Get-Date)
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Watcher -ConfigPath $cfg2 -Once | Out-Null
+    Assert-That 'catch-up consumed BOTH archives' ((-not (Test-Path $zipOld)) -and (-not (Test-Path $zipNew)))
+    Assert-That 'ordering: NEWEST archive wins the collision' `
+        ((Get-Content (Join-Path $watch 'order.txt') -Raw).Trim() -eq 'NEWER') `
+        "got '$((Get-Content (Join-Path $watch 'order.txt') -Raw).Trim())' - oldest-first ordering is broken"
+
+    # ---- v1.3.0 (A2): heartbeat proves alive-vs-dead ------------------------
+    # Runs the real loop (NOT -Once) with a sub-minute beat, then kills it the same way the
+    # 2026-08-14 death happened and checks the log actually recorded liveness.
+    $hbLogs = Join-Path $sandbox 'hblogs'; New-Item -ItemType Directory -Force $hbLogs | Out-Null
+    $cfg3 = Join-Path $sandbox 'config-hb.json'
+    @{
+        WatchFolder = $watch; ExtractTo = $watch; LogDir = $hbLogs
+        WatchFileName = 'files.zip'; OrphanWarnPattern = '^files \(\d+\)\.zip$'
+        TimestampFormat = 'yyyy-MM-dd-HH-mm'; RenamePrefix = 'files-'
+        KeepZipAfterExtract = $true; Overwrite = $true
+        StableSeconds = 1; StableChecks = 1; PollSeconds = 1; SettleTimeoutSeconds = 60
+        LogRetentionDays = 1
+        ProcessOrphansOnStartup = $true; HeartbeatMinutes = 0.05   # ~3 s
+    } | ConvertTo-Json | Set-Content $cfg3 -Encoding UTF8
+
+    $proc = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
+              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Watcher`"",'-ConfigPath',"`"$cfg3`""
+    Start-Sleep -Seconds 12
+    try { $proc.Kill() } catch { }
+    Start-Sleep -Seconds 1
+
+    $hbFile = Get-ChildItem $hbLogs -Filter 'watcher-*.log' -EA SilentlyContinue | Select-Object -First 1
+    Assert-That 'heartbeat: log file created'      ($null -ne $hbFile)
+    if ($hbFile) {
+        $hbText = Get-Content $hbFile.FullName -Raw
+        $beats  = @([regex]::Matches($hbText, 'Heartbeat: alive, idle\.')).Count
+        Assert-That 'heartbeat: announced at startup'  ($hbText -match 'Heartbeat : every')
+        Assert-That 'heartbeat: beats while idle'      ($beats -ge 2) "saw $beats beats in ~12 s at 3 s/beat"
+        Assert-That 'heartbeat: log named for today'   ($hbFile.Name -eq ("watcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))) $hbFile.Name
+    }
 
     Write-Host ""
     if ($fail -eq 0) { Write-Host "ALL $pass CHECKS PASSED" -ForegroundColor Green }

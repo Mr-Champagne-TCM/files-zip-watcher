@@ -4,10 +4,15 @@
   "WatchFolder": "%USERPROFILE%\\Downloads",
   "ExtractTo": "%USERPROFILE%\\Downloads",
 
-  "_WatchFileName": "EXACT filename only. Chrome dedupe variants like 'files (1).zip' are NOT processed by design -- see README 'Why only files.zip'.",
+  "_WatchFileName": "EXACT filename only, in steady state. Chrome dedupe variants like 'files (1).zip' are never detected live -- see README 'Why only files.zip'.",
   "WatchFileName": "files.zip",
-  "_OrphanWarnPattern": "If a dedupe variant is seen at startup we log a WARN (it means the watcher was down) but take no action.",
+  "_OrphanWarnPattern": "Identifies Chrome dedupe variants. Seeing one means the watcher was down when it arrived.",
   "OrphanWarnPattern": "^files \\(\\d+\\)\\.zip$",
+  "_ProcessOrphansOnStartup": "v1.3.0. true = the startup sweep also PROCESSES dedupe orphans, oldest-first so the newest download wins collisions. false = the old behaviour, warn only. Startup only; steady-state detection stays exact-name.",
+  "ProcessOrphansOnStartup": true,
+
+  "_HeartbeatMinutes": "v1.3.0. Writes a periodic 'alive, idle' line so a silent log proves the watcher is DEAD rather than merely idle. Bounds an unexplained death to this many minutes. 0 disables.",
+  "HeartbeatMinutes": 60,
 
   "_TimestampFormat": ".NET format string. yyyy-MM-dd-HH-mm -> files-2026-08-05-19-32.zip",
   "TimestampFormat": "yyyy-MM-dd-HH-mm",

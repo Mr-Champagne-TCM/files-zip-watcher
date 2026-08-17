@@ -70,6 +70,12 @@ function Get-WatcherConfig {
         # needs to create "files (1).zip". Seeing one means we were down; we warn instead.
         WatchFileName   = 'files.zip'
         OrphanWarnPattern = '^files \(\d+\)\.zip$'
+        # v1.3.0: startup catch-up may now PROCESS dedupe orphans instead of only warning.
+        # Steady-state detection is unchanged and still exact-name-only -- this is startup only.
+        ProcessOrphansOnStartup = $true
+        # v1.3.0: periodic "still alive" line so a silent log means DEAD, not merely idle.
+        # 0 disables. Bounds the unknown window on a death to this many minutes.
+        HeartbeatMinutes = 60
         # yyyy-MM-dd-HH-mm  ->  files-2026-08-05-19-32.zip
         TimestampFormat = 'yyyy-MM-dd-HH-mm'
         RenamePrefix    = 'files-'
@@ -107,13 +113,20 @@ function Get-WatcherConfig {
 # ---------------------------------------------------------------------------
 
 $script:LogFile = $null
+$script:LogDir  = $null
+
+function Get-LogPath {
+    param([string]$Dir)
+    return (Join-Path $Dir ("watcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd')))
+}
 
 function Initialize-Log {
     param($Config)
     if (-not (Test-Path $Config.LogDir)) {
         New-Item -ItemType Directory -Force -Path $Config.LogDir | Out-Null
     }
-    $script:LogFile = Join-Path $Config.LogDir ("watcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
+    $script:LogDir  = $Config.LogDir
+    $script:LogFile = Get-LogPath -Dir $Config.LogDir
 
     Get-ChildItem $Config.LogDir -Filter 'watcher-*.log' -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1 * [int]$Config.LogRetentionDays) } |
@@ -127,6 +140,16 @@ function Write-Log {
     )
     $line = "{0} [{1,-5}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Write-Host $line
+
+    # Roll to today's file. Initialize-Log runs ONCE at startup, so without this a watcher that
+    # stays up for days keeps writing into the file named for the day it started -- which would
+    # make the v1.3.0 heartbeat useless for dating a death (beats for 08-18 landing in the
+    # 08-17 log). Cheap: a string compare per line.
+    if ($script:LogDir) {
+        $want = Get-LogPath -Dir $script:LogDir
+        if ($want -ne $script:LogFile) { $script:LogFile = $want }
+    }
+
     if ($script:LogFile) {
         try { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 } catch { }
     }
@@ -448,25 +471,73 @@ function Invoke-Check {
     finally { $script:Busy = $false; Compress-Footprint }
 }
 
-function Write-OrphanWarning {
+function Get-OrphanArchive {
     <#
         A "files (1).zip" means Chrome had to dedupe -- i.e. the watcher was NOT running when
-        that download landed. We deliberately do not process it (exact-name-only policy), but
-        we say so loudly instead of letting it rot unnoticed.
+        that download landed. One directory read, startup only.
     #>
     param($Config)
     try {
-        $orphans = Get-ChildItem -LiteralPath $Config.WatchFolder -Filter 'files (*.zip' -File -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -match $Config.OrphanWarnPattern }
+        return @(Get-ChildItem -LiteralPath $Config.WatchFolder -Filter 'files (*.zip' -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -match $Config.OrphanWarnPattern })
+    } catch { return @() }
+}
+
+function Invoke-StartupCatchUp {
+    <#
+        Startup-only sweep. Processes everything waiting in the watch folder -- the exact-name
+        archive AND (when ProcessOrphansOnStartup) any Chrome dedupe orphans left behind while
+        we were down. Steady-state detection is untouched: still one O(1) Test-Path on one path.
+
+        ORDERING IS OLDEST-FIRST, and that is deliberate. Collisions are won by whichever
+        archive extracts LAST, so the newest download must go last. Do NOT assume 'files.zip'
+        is the newest -- Chrome only creates 'files (1).zip' *because* 'files.zip' already
+        existed, so the orphan is normally the NEWER of the two. Sorting by LastWriteTime is
+        the only ordering that is correct regardless of naming.
+    #>
+    param($Config)
+
+    $orphans = @(Get-OrphanArchive -Config $Config)
+
+    if (-not $Config.ProcessOrphansOnStartup) {
         foreach ($o in $orphans) {
-            Write-Log ("Orphan found (watcher was down when it arrived): '{0}'. Not processed -- exact-name policy. Rename it to '{1}' to have it handled." -f $o.Name, $Config.WatchFileName) 'WARN'
+            Write-Log ("Orphan found (watcher was down when it arrived): '{0}'. Not processed -- ProcessOrphansOnStartup is false. Rename it to '{1}' to have it handled." -f $o.Name, $Config.WatchFileName) 'WARN'
         }
-    } catch { }
+        Invoke-Check -Config $Config
+        return
+    }
+
+    $candidates = New-Object System.Collections.ArrayList
+    if (Test-Path -LiteralPath $script:TargetPath) {
+        try { [void]$candidates.Add((Get-Item -LiteralPath $script:TargetPath -Force)) } catch { }
+    }
+    foreach ($o in $orphans) { [void]$candidates.Add($o) }
+
+    if ($candidates.Count -eq 0) { return }
+
+    if ($orphans.Count -gt 0) {
+        Write-Log ("Startup catch-up: {0} archive(s) waiting, {1} of them Chrome dedupe orphan(s) -- the watcher was down when those arrived." -f $candidates.Count, $orphans.Count) 'WARN'
+    }
+
+    $ordered = @($candidates | Sort-Object LastWriteTime)
+    $n = 0
+    foreach ($c in $ordered) {
+        $n++
+        if (-not (Test-Path -LiteralPath $c.FullName)) { continue }   # a prior iteration consumed it
+        if ($ordered.Count -gt 1) {
+            Write-Log ("Catch-up {0}/{1}: '{2}' (modified {3})" -f $n, $ordered.Count, $c.Name, $c.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
+        }
+        $script:Busy = $true
+        try     { Invoke-ProcessZip -Path $c.FullName -Config $Config }
+        catch   { Write-Log "Catch-up failed for '$($c.Name)': $($_.Exception.Message)" 'ERROR' }
+        finally { $script:Busy = $false; Compress-Footprint }
+    }
 }
 
 try {
-    Write-OrphanWarning -Config $Config     # startup only: one directory read, then never again
-    Invoke-Check -Config $Config            # catch up on anything already sitting there
+    # Startup only: one directory read, then never again. Handles the exact-name archive and
+    # any dedupe orphans together, oldest-first.
+    Invoke-StartupCatchUp -Config $Config
 
     if ($Once) { Write-Log 'ONCE mode complete.'; exit 0 }
 
@@ -480,13 +551,28 @@ try {
     Register-ObjectEvent $fsw Renamed -SourceIdentifier FZW_Renamed | Out-Null
 
     Compress-Footprint
+    # [double], not [int]: fractional values let the self-test exercise a real beat in seconds
+    # instead of idling a minute. Users set whole minutes.
+    $hbMin = [double]$Config.HeartbeatMinutes
+    if ($hbMin -gt 0) { Write-Log ("Heartbeat : every {0} min (a silent log now means DEAD, not idle)" -f $hbMin) }
     Write-Log 'Watching. Idle until files.zip appears.' 'OK'
+
+    $script:LastBeat = Get-Date
 
     while ($true) {
         # Blocks (no CPU) until an event fires or the long safety timeout elapses.
         $evt = Wait-Event -Timeout ([int]$Config.PollSeconds)
         if ($evt) { Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue }
         Invoke-Check -Config $Config
+
+        # The whole point of A2: an abrupt external kill (taskkill, console close, 0xC000013A)
+        # leaves NO log line at all, so previously a dead watcher and an idle one were
+        # indistinguishable. Now the last beat brackets the death to within HeartbeatMinutes.
+        if ($hbMin -gt 0 -and ((Get-Date) - $script:LastBeat).TotalMinutes -ge $hbMin) {
+            Write-Log 'Heartbeat: alive, idle.'
+            $script:LastBeat = Get-Date
+        }
+
         if (-not $evt) { Compress-Footprint }   # periodic trim on the quiet path
     }
 }

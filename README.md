@@ -71,20 +71,56 @@ The task is configured to behave like a service anyway:
 | Setting | Value | Why |
 |---|---|---|
 | Trigger | At log on | Starts with your session |
+| Trigger | **every 15 min** | **Self-heal — see below** |
 | Execution time limit | *none* | Never killed for running "too long" |
 | Restart on failure | 3 ×, 1 min apart | Survives a crash |
 | Multiple instances | `IgnoreNew` | Never double-processes |
 | On battery | keeps running | Laptop-safe |
 | Window | hidden | No console popup |
 
-If you ever genuinely need it before login, run **from an elevated PowerShell**:
+### Why the repeating trigger (added in 1.3.0)
+
+A logon-only trigger has a nasty failure mode, and it bit for real on **2026-08-14**: something
+external closed the watcher mid-session (exit `0xC000013A` — a console-control close, not a
+crash, so the script's own error handler never ran and logged nothing). The machine did not
+reboot for three days, so the logon trigger never fired again. The watcher stayed dead until
+**08-17** and silently missed a download.
+
+`RestartOnFailure` did not save it — Windows recorded the task as *completed with an error code*,
+not *failed to start*, so the restart policy never applied.
+
+The repeating trigger is the fix: a dead watcher revives itself within one interval, no reboot
+needed. Redundant starts are free — the per-folder mutex makes a second instance exit 0
+immediately.
 
 ```powershell
-.\install.ps1 -AtBoot      # adds an AtStartup trigger, runs as SYSTEM
+.\install.ps1 -RepeatMinutes 30   # default 15; 0 = logon only (not recommended)
 ```
 
-A single-instance mutex (`Global\FilesZipWatcher_SingleInstance`) guarantees only one copy
-processes archives even if both triggers fire.
+> ⚠️ **`-AtBoot` runs the task as SYSTEM**, and there is only one task — so the *logon* trigger
+> runs as SYSTEM too. Under SYSTEM `%USERPROFILE%` resolves to
+> `C:\Windows\system32\config\systemprofile`, meaning the watcher would sit watching a folder no
+> browser ever writes to while reporting itself perfectly healthy. Since 1.3.0 `install.ps1`
+> **refuses** `-AtBoot` unless `WatchFolder`/`ExtractTo` are absolute paths.
+
+```powershell
+.\install.ps1 -AtBoot      # elevated; requires absolute paths in config.json
+```
+
+A single-instance mutex (scoped per watch folder) guarantees only one copy processes archives
+even if several triggers fire.
+
+### How do I tell a dead watcher from an idle one?
+
+Before 1.3.0 you could not — both produced a log that simply stopped. Since 1.3.0 the watcher
+writes a heartbeat every `HeartbeatMinutes` (default 60):
+
+```
+2026-08-17 13:03:13 [INFO ] Heartbeat: alive, idle.
+```
+
+A log whose last heartbeat is hours old means the process is **gone**, and brackets the death to
+within one interval.
 
 ---
 
@@ -235,17 +271,39 @@ Only the **exact** filename is processed. Chrome's dedupe variants — `files (1
 > so Chrome never has a reason to create a `(1)` variant in the first place.
 
 A variant appearing therefore *means something*: the watcher was down when that download landed.
-Silently processing it would hide that. Instead, on startup the watcher does one directory read,
-and logs a warning for each orphan it finds:
+
+**In steady state that is still true** — the live FileSystemWatcher is filtered to one exact
+name, which is what keeps the hot path O(1).
+
+**On startup, since 1.3.0, orphans are processed rather than merely reported.** The original
+warn-only policy was the wrong call in practice: an orphan exists precisely *because* the watcher
+was down, so refusing to touch it stranded the very payload the tool was meant to catch — you got
+a warning instead of your files. The signal is preserved by logging it loudly, not by withholding
+the work:
+
+```
+[WARN ] Startup catch-up: 2 archive(s) waiting, 1 of them Chrome dedupe orphan(s)
+        -- the watcher was down when those arrived.
+[INFO ] Catch-up 1/2: 'files.zip' (modified 2026-08-17 09:14:02)
+[INFO ] Catch-up 2/2: 'files (1).zip' (modified 2026-08-17 11:31:47)
+```
+
+### Ordering: oldest first
+
+Archives are processed **oldest-first by `LastWriteTime`**, so the newest download extracts last
+and wins any collision.
+
+The tempting shortcut — "process `files.zip` first, then the variants" — is **wrong**. Chrome
+creates `files (1).zip` only *because* `files.zip` already existed, so the orphan is normally the
+**newer** download. Handling the exact-name file first would let a stale archive overwrite fresher
+files. There is a regression test for exactly this.
+
+Set `"ProcessOrphansOnStartup": false` for the 1.1.0–1.2.0 warn-only behaviour:
 
 ```
 [WARN ] Orphan found (watcher was down when it arrived): 'files (1).zip'.
-        Not processed -- exact-name policy. Rename it to 'files.zip' to have it handled.
+        Not processed -- ProcessOrphansOnStartup is false. Rename it to 'files.zip'.
 ```
-
-Rename it and the watcher picks it up immediately. To process variants automatically anyway, set
-`WatchFileName` to a name you control — but note the tool matches one exact name by design, which
-is what keeps the hot path O(1).
 
 ## Timestamp format
 
@@ -275,7 +333,9 @@ After editing, apply with `.\install.ps1 -Restart`.
 | `WatchFolder` | `%USERPROFILE%\Downloads` | Folder to watch |
 | `ExtractTo` | `%USERPROFILE%\Downloads` | Where contents land (no wrapper folder) |
 | `WatchFileName` | `files.zip` | **Exact** filename. See [Why only `files.zip`](#why-only-fileszip) |
-| `OrphanWarnPattern` | `^files \(\d+\)\.zip$` | Variants matching this get a startup WARN, never processed |
+| `OrphanWarnPattern` | `^files \(\d+\)\.zip$` | Identifies Chrome dedupe variants |
+| `ProcessOrphansOnStartup` | `true` | Startup sweep also processes dedupe orphans, oldest-first. `false` = warn only |
+| `HeartbeatMinutes` | `60` | Periodic "alive, idle" log line so silence means dead. `0` disables |
 | `TimestampFormat` | `yyyy-MM-dd-HH-mm` | See above |
 | `RenamePrefix` | `files-` | Prefix for the renamed archive |
 | `KeepZipAfterExtract` | `true` | `false` deletes the archive after a successful extract |
@@ -328,9 +388,19 @@ A processed archive looks like:
 
 Runs entirely in a temp sandbox — **it never touches your real Downloads folder**. It builds a
 synthetic `files.zip` (plain file, nested folder, a deliberate collision, and a zip-slip attack
-entry) and asserts **23** behaviours including flat extraction, overwrite, no wrapper folder,
-traversal refusal, non-matching zips ignored, and that a `files (1).zip` variant is refused *and*
-raises the orphan warning.
+entry) and asserts **31** behaviours including flat extraction, overwrite, no wrapper folder,
+traversal refusal, non-matching zips ignored, manifest format and hash-vs-disk agreement, and
+both orphan modes.
+
+Three of those checks exist because of the 1.3.0 outage specifically:
+
+- **oldest-first ordering** — a genuinely older `files.zip` must lose the collision to a newer
+  `files (1).zip`, since that is the real-world arrangement Chrome produces
+- **heartbeat beats while idle** — runs the *real* loop (not `-Once`), then kills it the way the
+  08-14 death happened, and asserts the log recorded liveness
+- **heartbeat lands in today's log file** — guards the log-rolling fix
+
+Takes roughly 30 seconds; the heartbeat check deliberately spends ~12 s watching a live loop.
 
 The single-instance mutex is scoped **per watch folder**, so the self-test and manual `-Once`
 runs work normally while the installed service is live.
