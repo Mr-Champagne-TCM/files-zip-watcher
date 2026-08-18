@@ -25,6 +25,12 @@
 .PARAMETER Once
     Process anything already present, then exit. Used by tests and manual catch-up runs.
 
+.PARAMETER Live
+    Show live output. If a watcher is already running (the normal case -- the scheduled task runs
+    windowless under S4U), this ATTACHES to its log as a read-only viewer, so closing the window
+    cannot affect it. If nothing is running, it runs one in the foreground instead. Prefer the
+    `watch-live.ps1` wrapper at the repo root.
+
 .NOTES
     Repo    : https://github.com/Mr-Champagne-TCM/files-zip-watcher
     Requires: Windows PowerShell 5.1+ (no external modules)
@@ -32,7 +38,8 @@
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
-    [switch]$Once
+    [switch]$Once,
+    [switch]$Live
 )
 
 Set-StrictMode -Version Latest
@@ -152,6 +159,66 @@ function Write-Log {
 
     if ($script:LogFile) {
         try { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 } catch { }
+    }
+}
+
+function Start-LiveTail {
+    <#
+        -Live ATTACH MODE. The production watcher runs windowless (Task Scheduler S4U), so there
+        is no console to look at and nothing to attach a debugger to. Instead we follow its log
+        file, which is the same stream its Write-Host would have produced.
+
+        This is strictly a READER. It never touches the watch folder, never takes the lock, and
+        the running watcher neither knows nor cares that it exists -- so closing this window can
+        not affect the watcher in any way. That is the whole point.
+
+        Follows across midnight: the log path is recomputed every poll, so a roll to tomorrow's
+        file is picked up instead of silently tailing yesterday's forever.
+    #>
+    param($Config, [int]$TailLines = 25)
+
+    $path = Get-LogPath -Dir $Config.LogDir
+    Write-Host ''
+    Write-Host '  FilesZipWatcher -- LIVE (attached to the running watcher)' -ForegroundColor Cyan
+    Write-Host "  log: $path" -ForegroundColor DarkGray
+    Write-Host '  Read-only view. Closing this window does NOT stop the watcher.' -ForegroundColor Green
+    Write-Host '  Ctrl+C to detach.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $pos = 0
+    if (Test-Path -LiteralPath $path) {
+        Get-Content -LiteralPath $path -Tail $TailLines -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        try { $pos = (Get-Item -LiteralPath $path -Force).Length } catch { $pos = 0 }
+    } else {
+        Write-Host '  (no log file yet -- waiting for the watcher to write one)' -ForegroundColor DarkGray
+    }
+
+    while ($true) {
+        Start-Sleep -Milliseconds 500
+
+        $cur = Get-LogPath -Dir $Config.LogDir
+        if ($cur -ne $path) {
+            Write-Host ''
+            Write-Host "  --- log rolled to $(Split-Path $cur -Leaf) ---" -ForegroundColor DarkGray
+            $path = $cur; $pos = 0
+        }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+
+        try { $len = (Get-Item -LiteralPath $path -Force).Length } catch { continue }
+        if ($len -lt $pos) { $pos = 0 }      # truncated or replaced under us
+        if ($len -le $pos) { continue }
+
+        # FileShare ReadWrite -- must NOT lock the file, or we would block the watcher's own
+        # Add-Content and turn a read-only viewer into something that can break production.
+        try {
+            $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                [void]$fs.Seek($pos, [IO.SeekOrigin]::Begin)
+                $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
+                while (-not $sr.EndOfStream) { Write-Host $sr.ReadLine() }
+                $pos = $fs.Position
+            } finally { $fs.Dispose() }
+        } catch { }
     }
 }
 
@@ -442,13 +509,49 @@ if (-not (Test-Path $Config.ExtractTo)) {
 $folderKey = ([Security.Cryptography.MD5]::Create().ComputeHash(
                 [Text.Encoding]::UTF8.GetBytes($Config.WatchFolder.ToLowerInvariant().TrimEnd('\'))
              ) | ForEach-Object { $_.ToString('x2') }) -join ''
-$mutexName = "Global\FilesZipWatcher_$($folderKey.Substring(0,16))"
-try   { $mutex = New-Object System.Threading.Mutex($false, $mutexName) }
-catch { $mutex = New-Object System.Threading.Mutex($false, "Local\FilesZipWatcher_$($folderKey.Substring(0,16))") }
+# v1.4.0: a LOCK FILE, not a mutex.
+#
+# The old guard took a `Global\` named mutex and silently fell back to `Local\` if that failed.
+# Creating a Global\ object needs SeCreateGlobalPrivilege, which a non-elevated token does not
+# have -- so in practice both sides took the per-SESSION Local\ name. Once the watcher moved to
+# S4U (session 0) and a -Live viewer ran on the desktop (session 1), the two lived in different
+# namespaces, each concluded it was alone, and TWO watchers could run on one folder and
+# double-process an archive. Caught on the first real S4U run.
+#
+# An exclusively-opened file has none of those problems: the lock is machine-wide, needs no
+# privilege, and the OS releases it automatically when the holder dies -- so there is no such
+# thing as a stale lock to clean up.
+$lockPath = Join-Path $Config.LogDir ("watcher-{0}.lock" -f $folderKey.Substring(0,16))
+$lock = $null
+try {
+    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $stamp = [Text.Encoding]::UTF8.GetBytes(("pid={0} session={1} started={2}`n" -f `
+                $PID, [Diagnostics.Process]::GetCurrentProcess().SessionId, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))
+    $lock.SetLength(0); $lock.Write($stamp, 0, $stamp.Length); $lock.Flush()
+} catch {
+    $lock = $null
+}
 
-if (-not $mutex.WaitOne(0)) {
+if (-not $lock) {
+    # Somebody else owns this watch folder.
+    if ($Live) {
+        # Expected case: the scheduled task is running windowless and we just want to watch it.
+        # Attach to its log rather than refusing -- and hold no lock of our own.
+        Start-LiveTail -Config $Config
+        exit 0
+    }
     Write-Log "Another watcher is already running for '$($Config.WatchFolder)'. Exiting." 'WARN'
     exit 0
+}
+
+if ($Live) {
+    # Nothing else is running, so -Live becomes a real foreground watcher with visible output.
+    # Closing this window DOES stop this instance -- but the scheduled task's self-heal trigger
+    # brings the background watcher back within its repeat interval, so nothing stays broken.
+    Write-Host ''
+    Write-Host '  FilesZipWatcher -- LIVE (foreground; no background watcher was running)' -ForegroundColor Yellow
+    Write-Host '  Closing this window stops THIS instance; the scheduled task self-heals within 15 min.' -ForegroundColor DarkGray
+    Write-Host ''
 }
 
 # The single path we care about. O(1) checks -- never a directory enumeration.
@@ -583,6 +686,8 @@ catch {
 finally {
     Unregister-Event -SourceIdentifier FZW_Created -ErrorAction SilentlyContinue
     Unregister-Event -SourceIdentifier FZW_Renamed -ErrorAction SilentlyContinue
-    if ($mutex) { try { $mutex.ReleaseMutex() } catch { }; $mutex.Dispose() }
+    # Releases the single-instance lock. The OS would do this anyway on process death (including
+    # a hard kill), which is exactly why a lock FILE is safer than a named mutex here.
+    if ($lock) { try { $lock.Dispose() } catch { } }
     Write-Log '=== FilesZipWatcher stopped ==='
 }

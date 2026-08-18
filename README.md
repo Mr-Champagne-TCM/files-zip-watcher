@@ -42,7 +42,11 @@ cd files-zip-watcher
 .\install.ps1
 ```
 
-That's it — it starts immediately and every time you log in. No admin rights needed.
+That's it — it starts immediately and every time you log in.
+
+> Run this from an **elevated** PowerShell to get the windowless (S4U) task. Without elevation it
+> still installs and works, but as an Interactive task that pops a Windows Terminal window on every
+> launch — see [Why is there no console window?](#why-is-there-no-console-window-and-how-to-watch-it-anyway).
 
 **Verify it's alive:**
 
@@ -64,7 +68,8 @@ Get-Content "$env:LOCALAPPDATA\FilesZipWatcher\logs\watcher-$(Get-Date -f yyyy-M
 A true Windows Service (or a task that runs *before* anyone logs in) requires administrator
 rights to install. This watcher does not need that scope, because **Chrome only downloads while
 you are logged in** — so a logon-triggered task that runs continuously in your session covers
-100% of the real cases, and installs with zero elevation.
+100% of the real cases. (Elevation is needed only to register the *windowless* S4U task; without
+it you get a working watcher that shows a console window.)
 
 The task is configured to behave like a service anyway:
 
@@ -76,7 +81,7 @@ The task is configured to behave like a service anyway:
 | Restart on failure | 3 ×, 1 min apart | Survives a crash |
 | Multiple instances | `IgnoreNew` | Never double-processes |
 | On battery | keeps running | Laptop-safe |
-| Window | hidden | No console popup |
+| Logon type | `S4U` (session 0) | **No console window can exist** — see below |
 
 ### Why the repeating trigger (added in 1.3.0)
 
@@ -90,7 +95,7 @@ reboot for three days, so the logon trigger never fired again. The watcher staye
 not *failed to start*, so the restart policy never applied.
 
 The repeating trigger is the fix: a dead watcher revives itself within one interval, no reboot
-needed. Redundant starts are free — the per-folder mutex makes a second instance exit 0
+needed. Redundant starts are free — the per-folder lock file makes a second instance exit 0
 immediately.
 
 ```powershell
@@ -107,8 +112,40 @@ immediately.
 .\install.ps1 -AtBoot      # elevated; requires absolute paths in config.json
 ```
 
-A single-instance mutex (scoped per watch folder) guarantees only one copy processes archives
-even if several triggers fire.
+A single-instance **lock file** (scoped per watch folder, in the log directory) guarantees only one
+copy processes archives even if several triggers fire. It replaced a named mutex in 1.4.0: the
+mutex fell back to a per-*session* name without `SeCreateGlobalPrivilege`, so a session-0 watcher
+and a session-1 one could not see each other and both would run.
+
+### Why is there no console window? (and how to watch it anyway)
+
+The task runs with `LogonType: S4U` — non-interactive, in session 0. **No console window exists**,
+which is deliberate.
+
+On Windows 11, `-WindowStyle Hidden` does **not** keep a scheduled task quiet. It governs
+PowerShell's own legacy console, but the default console host is **Windows Terminal**: a separate
+process that opens its own visible window and renders the output. An Interactive task therefore
+pops a terminal on every launch — and **closing that window sends `CTRL_CLOSE_EVENT`, killing the
+watcher with exit `0xC000013A`**. That is almost certainly what started the 2026-08-14 outage.
+
+To watch it live, use the viewer instead:
+
+```powershell
+.\watch-live.ps1
+```
+
+It attaches to the running watcher's log as a **read-only** follower — no lock, no writes, nothing
+the watcher can notice. **Close it whenever you like.** If no watcher is running, it runs one in
+the foreground instead and tells you so.
+
+> Registering the S4U task **requires an elevated PowerShell**. If it can't, `install.ps1` falls
+> back to an Interactive task and warns you — that is the window-popping mode. Replacing an
+> already-registered S4U task also needs elevation.
+
+> **Diagnosing liveness:** a session-0 process reports `CommandLine` as `$null` to a non-elevated
+> caller, so `Win32_Process | Where CommandLine -like '*FilesZipWatcher*'` returns **nothing while
+> the watcher is running fine.** Use the task state, a session-0 `powershell.exe`, and heartbeat
+> freshness instead.
 
 ### How do I tell a dead watcher from an idle one?
 
@@ -138,7 +175,8 @@ at 3 a.m.
 | Sleep / hibernate | suspended | resumes on wake, sweep catches up | ✅ |
 
 Confirmed on the installed task: `RunOnlyIfIdle=False`, `StopOnIdleEnd=False`, no execution time
-limit, `LogonType=Interactive`, process in interactive session 1.
+limit, `LogonType=S4U`, process in session 0. Since 1.4.0 the watcher no longer depends on the
+interactive session at all, so locking, signing out, and closing windows are all irrelevant to it.
 
 The only genuine gap is a writer running *outside* your interactive session — a SYSTEM service or
 a scheduled job dropping `files.zip` while nobody is signed in. That is what `install.ps1 -AtBoot`
@@ -388,7 +426,7 @@ A processed archive looks like:
 
 Runs entirely in a temp sandbox — **it never touches your real Downloads folder**. It builds a
 synthetic `files.zip` (plain file, nested folder, a deliberate collision, and a zip-slip attack
-entry) and asserts **31** behaviours including flat extraction, overwrite, no wrapper folder,
+entry) and asserts **38** behaviours including flat extraction, overwrite, no wrapper folder,
 traversal refusal, non-matching zips ignored, manifest format and hash-vs-disk agreement, and
 both orphan modes.
 
@@ -402,8 +440,8 @@ Three of those checks exist because of the 1.3.0 outage specifically:
 
 Takes roughly 30 seconds; the heartbeat check deliberately spends ~12 s watching a live loop.
 
-The single-instance mutex is scoped **per watch folder**, so the self-test and manual `-Once`
-runs work normally while the installed service is live.
+The single-instance **lock file** is scoped **per watch folder**, so the self-test and manual
+`-Once` runs work normally while the installed service is live.
 
 Manual catch-up run without installing anything:
 
@@ -420,7 +458,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\src\FilesZipWatcher.ps1 -O
 | Nothing happens | `Get-ScheduledTask FilesZipWatcher \| Select State` — should be `Running` |
 | Task shows `Ready`, not `Running` | It exited. Read today's log; then `Start-ScheduledTask -TaskName FilesZipWatcher` |
 | Archive renamed but not extracted | Log will show the extract error — usually a locked destination file |
-| Two copies seem to run | Impossible by design (mutex); confirm with `Get-CimInstance Win32_Process -Filter "Name='powershell.exe'"` |
+| Two copies seem to run | Prevented by the per-folder lock file. Confirm with `Get-CimInstance Win32_Process -Filter "Name='powershell.exe'"` — note the S4U watcher is in **session 0** and its `CommandLine` reads as `$null` when you are not elevated |
 | Want it to react faster | Lower `StableSeconds`, but you trade off against truncated-download risk |
 | Config edit not applied | `.\install.ps1 -Restart` |
 
@@ -435,6 +473,7 @@ files-zip-watcher/
 ├─ config.json                 # all tunables
 ├─ install.ps1                 # register + start the task
 ├─ uninstall.ps1               # stop + remove (optionally purge logs)
+├─ watch-live.ps1              # safe read-only live view of the running watcher
 ├─ docs/DESIGN.md              # why it's built this way; edge cases
 ├─ CHANGELOG.md
 └─ LICENSE                     # MIT

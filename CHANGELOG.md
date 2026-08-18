@@ -3,6 +3,62 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] — 2026-08-18
+
+Silence. v1.3.0 fixed the watcher dying; this fixes **why it kept dying** — and closes a
+single-instance hole that v1.3.0's own fix exposed.
+
+### The window nobody asked for
+The task ran with `LogonType: Interactive` and `-WindowStyle Hidden`. On Windows 11 that switch
+**does not work**: it governs PowerShell's own legacy console, but the default console host is
+Windows Terminal — a separate process that opens its own visible window and renders the output.
+So every launch popped a terminal showing the log.
+
+Closing that window sends `CTRL_CLOSE_EVENT`, and the process exits with **`0xC000013A`** — the
+exact code from the 2026-08-14 outage. That window was almost certainly the original cause: close
+it once, and with a logon-only trigger the watcher was gone until the next sign-in. v1.3.0's
+15-minute self-heal then turned a silent one-shot failure into a window that reappeared every few
+minutes, which is how it was finally noticed.
+
+### Added
+- **Windowless by default.** The task now registers with `LogonType: S4U` ("run whether user is
+  logged on or not"), running non-interactively in session 0 as the same user. No window can
+  exist, so no window can be closed. `%USERPROFILE%` still resolves correctly — unlike
+  `-AtBoot`/SYSTEM, which does not. Registering S4U **requires an elevated shell**; if that
+  fails, `install.ps1` falls back to Interactive and says loudly what you are getting.
+- **`watch-live.ps1` — the live view, made safe.** Attaches to the running watcher's log as a
+  **read-only** follower: no lock, no writes, nothing the watcher can notice. Close it whenever
+  you like. If no watcher is running it instead runs one in the foreground, and says so. Follows
+  the log across midnight rollover.
+- `-Live` switch on the watcher script, which `watch-live.ps1` wraps.
+- `install.ps1 -Interactive` to deliberately opt back into the desktop/windowed task, with a
+  warning explaining the hazard.
+
+### Fixed
+- **Single-instance guard was per-session, so two watchers could run at once.** The guard took a
+  `Global\` named mutex and silently fell back to `Local\` on failure — and creating a `Global\`
+  object needs `SeCreateGlobalPrivilege`, which a non-elevated token lacks. Both sides therefore
+  took the **per-session** `Local\` name. Once the watcher moved to session 0 and a live viewer
+  ran on the desktop in session 1, each concluded it was alone: **two watchers on one folder,
+  able to double-process an archive.** Caught on the first real S4U run, by the viewer announcing
+  "no background watcher was running" while one plainly was.
+  Replaced with an **exclusively-opened lock file** — machine-wide, needs no privilege, and
+  released by the OS on process death, so there is no stale lock to clean up.
+- **`install.ps1` failed opaquely when replacing an elevated task.** It stopped the task, then
+  `Unregister-ScheduledTask` threw a raw CIM "Access is denied" — leaving no watcher running and
+  no clue why. Now caught, with the reason and the one command needed to recover.
+
+### Note for anyone diagnosing this later
+A session-0 process reports `CommandLine` as `$null` to a non-elevated caller, so the obvious
+`Win32_Process | Where CommandLine -like '*FilesZipWatcher*'` liveness check returns **zero
+matches while the watcher is running fine**. Use the task state, a session-0 `powershell.exe`,
+and heartbeat freshness instead.
+
+### Self-test
+31 → **38 assertions**, adding: the viewer attaches instead of refusing, announces it is safe to
+close, streams real log content, and — the guarantee that matters — **killing the viewer leaves
+the watcher both running and still able to process a zip.**
+
 ## [1.3.0] — 2026-08-17
 
 Survivability. Driven by a real three-day outage: the watcher was killed mid-session on 08-14

@@ -27,6 +27,11 @@
     How often the task re-triggers as a self-heal. Default 15. Set 0 to disable (logon only --
     NOT recommended; that is the exact configuration that failed on 2026-08-14).
 
+.PARAMETER Interactive
+    Run the task on your desktop instead of windowless. Windows Terminal will pop a console
+    window on every launch, and closing it kills the watcher. Debugging only -- prefer
+    `.\watch-live.ps1`, which shows the same output and is safe to close.
+
 .PARAMETER AtBoot
     Also trigger at system startup, running as SYSTEM whether logged on or not. Needs elevation.
 
@@ -40,6 +45,7 @@
 param(
     [switch]$Restart,
     [ValidateRange(0,1440)][int]$RepeatMinutes = 15,
+    [switch]$Interactive,
     [switch]$AtBoot
 )
 
@@ -121,21 +127,65 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -StartWhenAvailable
 
+# PRINCIPAL / LOGON TYPE -- this is what decides whether a console window appears.
+#
+# LogonType Interactive runs the task on your desktop. On Windows 11 the default console host is
+# Windows Terminal, and `-WindowStyle Hidden` CANNOT hide it: PowerShell's switch only governs
+# its own legacy console, while Windows Terminal is a separate process that opens its own visible
+# window. So an Interactive task pops a terminal on every launch -- and closing that window sends
+# CTRL_CLOSE_EVENT, killing the watcher with exit 0xC000013A. That is exactly how the 2026-08-14
+# outage started, and with a 15-minute self-heal it becomes a window that keeps coming back.
+#
+# S4U ("run whether user is logged on or not") runs the task in a non-interactive session as the
+# same user: no window can exist, so no window can be closed. %USERPROFILE% still resolves to the
+# real profile because it is still that user -- unlike -AtBoot/SYSTEM, which does not.
 if ($AtBoot) {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-} else {
+} elseif ($Interactive) {
+    Write-Warning "-Interactive: the task will run on your desktop and Windows Terminal WILL show a window on every launch."
+    Write-Warning "Closing that window kills the watcher (exit 0xC000013A). Use this only for debugging."
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+} else {
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 }
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "  existing task found -- replacing" -ForegroundColor Yellow
     Stop-ScheduledTask   -TaskName $TaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    } catch {
+        # A task registered from an elevated shell (which S4U requires) can only be replaced from
+        # one. Without this the user gets a raw CIM "Access is denied" AFTER the task has already
+        # been stopped -- i.e. no watcher and no obvious reason why.
+        throw ("Cannot replace the existing task: $($_.Exception.Message)`n" +
+               "It was registered from an elevated shell (S4U requires that), so re-registering needs one too.`n" +
+               "Re-run this from an elevated PowerShell. The task has been STOPPED -- until you do, " +
+               "start it again with:  Start-ScheduledTask -TaskName $TaskName")
+    }
 }
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
-    -Settings $settings -Principal $principal `
-    -Description 'Watches Downloads for files.zip (Claude "Download All"), timestamps it, and extracts it in place. https://github.com/Mr-Champagne-TCM/files-zip-watcher' | Out-Null
+$desc = 'Watches Downloads for files.zip (Claude "Download All"), timestamps it, and extracts it in place. https://github.com/Mr-Champagne-TCM/files-zip-watcher'
+
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
+        -Settings $settings -Principal $principal -Description $desc -ErrorAction Stop | Out-Null
+}
+catch {
+    # S4U needs the "Log on as a batch job" right. If the account lacks it, registration fails
+    # here rather than at run time -- fall back so the user is left with a WORKING watcher, but
+    # say plainly what they are getting, because the fallback is the window-popping mode.
+    if (-not $AtBoot -and -not $Interactive) {
+        Write-Warning "Could not register the windowless (S4U) task: $($_.Exception.Message)"
+        Write-Warning "Falling back to an Interactive task -- Windows Terminal WILL pop a window on each launch."
+        Write-Warning "To fix properly, grant this account 'Log on as a batch job' (secpol.msc -> Local Policies -> User Rights Assignment), then re-run .\install.ps1 -Restart"
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
+            -Settings $settings -Principal $principal -Description $desc -ErrorAction Stop | Out-Null
+    } else {
+        throw
+    }
+}
 
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 2

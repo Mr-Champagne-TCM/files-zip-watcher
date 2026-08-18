@@ -221,6 +221,59 @@ try {
         Assert-That 'heartbeat: log named for today'   ($hbFile.Name -eq ("watcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))) $hbFile.Name
     }
 
+    # ---- v1.4.0: -Live attach mode must NOT disturb the running watcher ------
+    # The whole promise of watch-live.ps1 is "safe to close". That only holds if the viewer is
+    # a pure reader: it must not take the mutex, must not lock the log, and killing it must
+    # leave the watcher running.
+    $liveLogs = Join-Path $sandbox 'livelogs'; New-Item -ItemType Directory -Force $liveLogs | Out-Null
+    $cfg4 = Join-Path $sandbox 'config-live.json'
+    @{
+        WatchFolder = $watch; ExtractTo = $watch; LogDir = $liveLogs
+        WatchFileName = 'files.zip'; OrphanWarnPattern = '^files \(\d+\)\.zip$'
+        TimestampFormat = 'yyyy-MM-dd-HH-mm'; RenamePrefix = 'files-'
+        KeepZipAfterExtract = $true; Overwrite = $true
+        StableSeconds = 1; StableChecks = 1; PollSeconds = 1; SettleTimeoutSeconds = 60
+        LogRetentionDays = 1
+        ProcessOrphansOnStartup = $true; HeartbeatMinutes = 0.05
+    } | ConvertTo-Json | Set-Content $cfg4 -Encoding UTF8
+
+    # background "production" watcher holding the mutex
+    $bg = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Watcher`"",'-ConfigPath',"`"$cfg4`""
+    Start-Sleep -Seconds 6
+
+    # -Live must ATTACH (tail), not exit with the "already running" refusal
+    $liveOut = Join-Path $sandbox 'live-out.txt'
+    $viewer = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput $liveOut `
+                -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Watcher`"",'-ConfigPath',"`"$cfg4`"",'-Live'
+    Start-Sleep -Seconds 8
+
+    Assert-That 'live: viewer still running (attached, not refused)' (-not $viewer.HasExited)
+    $lt = if (Test-Path $liveOut) { Get-Content $liveOut -Raw } else { '' }
+    Assert-That 'live: announced attach mode'      ($lt -match 'attached to the running watcher')
+    Assert-That 'live: says closing is safe'       ($lt -match 'does NOT stop the watcher')
+    Assert-That 'live: streamed real log content'  ($lt -match 'Watching\. Idle|Heartbeat: alive')
+    Assert-That 'live: did NOT refuse via mutex'   ($lt -notmatch 'Another watcher is already running')
+
+    # killing the viewer must leave the watcher alive -- this is the "safe to close" guarantee
+    try { $viewer.Kill() } catch { }
+    Start-Sleep -Seconds 3
+    $bgAlive = $null -ne (Get-Process -Id $bg.Id -ErrorAction SilentlyContinue)
+    Assert-That 'live: closing the viewer leaves the watcher RUNNING' $bgAlive
+
+    # and the watcher must still be functional afterwards, not merely alive
+    $stageC = Join-Path $sandbox 'stageC'; New-Item -ItemType Directory -Force $stageC | Out-Null
+    Set-Content (Join-Path $stageC 'after-live.txt') 'still working' -Encoding UTF8
+    $zipC = Join-Path $sandbox 'afterlive.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($stageC, $zipC)
+    Move-Item $zipC (Join-Path $watch 'files.zip') -Force
+    Start-Sleep -Seconds 10
+    Assert-That 'live: watcher still PROCESSES zips after viewer closed' `
+        (Test-Path (Join-Path $watch 'after-live.txt'))
+
+    try { $bg.Kill() } catch { }
+
     Write-Host ""
     if ($fail -eq 0) { Write-Host "ALL $pass CHECKS PASSED" -ForegroundColor Green }
     else             { Write-Host "$pass passed, $fail FAILED" -ForegroundColor Red }
